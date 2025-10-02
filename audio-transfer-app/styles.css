@@ -1,0 +1,489 @@
+/* Custom styles for Audio Transfer App */
+
+/* Import Google Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* Improved dark theme with better contrast */
+:root {
+    --bg-primary: #0f172a;
+    --bg-secondary: #1e293b;
+    --bg-tertiary: #334155;
+    --text-primary: #f8fafc;
+    --text-secondary: #cbd5e1;
+    --text-muted: #94a3b8;
+    --accent-primary: #3b82f6;
+    --accent-secondary: #10b981;
+    --accent-danger: #ef4444;
+    --accent-warning: #f59e0b;
+    --border-primary: #475569;
+    --border-secondary: #64748b;
+    --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+}
+
+body {
+    background: linear-gradient(135deg, var(--bg-primary) 0%, #1e293b 50%, #334155 100%);
+    min-height: 100vh;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: var(--text-primary);
+    font-weight: 400;
+    line-height: 1.6;
+    overflow-y: scroll; /* Always show scrollbar to prevent layout shift */
+}
+
+/* Container centering and margins */
+.container-fluid {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding-left: 1rem;
+    padding-right: 1rem;
+}
+
+/* Tab container centering */
+.tab-container {
+    padding-left: 1rem !important;
+    padding-right: 1rem !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+}
+
+/* Prevent layout shift between tabs */
+.tab-content {
+    min-height: 80vh;
+}
+
+.tab-pane {
+    min-height: 75vh;
+}
+
+/* Improved typography */
+h1, h2, h3, h4, h5, h6 {
+    color: var(--text-primary);
+    font-weight: 600;
+    line-height: 1.2;
+    margin-bottom: 0.75rem;
+}
+
+h1 { font-size: 2.5rem; font-weight: 700; }
+h2 { font-size: 2rem; }
+h3 { font-size: 1.5rem; }
+h4 { font-size: 1.25rem; }
+h5 { font-size: 1.125rem; }
+
+p, span, div {
+    color: var(--text-secondary);
+}
+
+.text-muted {
+    color: var(--text-muted) !important;
+}
+
+.lead {
+    color: var(--text-secondary);
+    font-size: 1.125rem;
+    font-weight: 400;
+}
+
+/* Code and monospace text */
+code, .font-monospace {
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    background: var(--bg-primary);
+    color: var(--accent-secondary);
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    border: 1px solid var(--border-primary);
+}
+
+/* Smooth card enhancements */
+.card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    backdrop-filter: blur(10px);
+    transition: all 0.2s ease-out;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.card:hover {
+    border-color: var(--border-secondary);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.card-body {
+    color: var(--text-secondary);
+}
+
+.card-body h1, .card-body h2, .card-body h3, 
+.card-body h4, .card-body h5, .card-body h6 {
+    color: var(--text-primary);
+}
+
+/* Bootstrap component overrides */
+.bg-dark {
+    background-color: var(--bg-primary) !important;
+}
+
+.bg-secondary {
+    background-color: var(--bg-secondary) !important;
+}
+
+.text-light {
+    color: var(--text-primary) !important;
+}
+
+.text-white {
+    color: var(--text-primary) !important;
+}
+
+.text-secondary {
+    color: var(--text-secondary) !important;
+}
+
+.border-secondary {
+    border-color: var(--border-primary) !important;
+}
+
+/* Smooth, robust button improvements */
+.btn {
+    font-weight: 500;
+    font-size: 0.875rem;
+    border-radius: 0.5rem;
+    transition: all 0.15s ease-out;
+    border: none;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+    position: relative;
+    overflow: hidden;
+}
+
+.btn:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    filter: brightness(1.1);
+}
+
+.btn:active {
+    transform: translateY(1px);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    transition: all 0.1s ease-out;
+}
+
+.btn-primary {
+    background: var(--accent-primary);
+    color: var(--text-primary);
+}
+
+.btn-primary:hover {
+    background: #2563eb;
+    color: var(--text-primary);
+}
+
+.btn-success {
+    background: var(--accent-secondary);
+    color: var(--text-primary);
+}
+
+.btn-success:hover {
+    background: #059669;
+    color: var(--text-primary);
+}
+
+.btn-danger {
+    background: var(--accent-danger);
+    color: var(--text-primary);
+}
+
+.btn-danger:hover {
+    background: #dc2626;
+    color: var(--text-primary);
+}
+
+.btn-secondary {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-primary);
+}
+
+.btn-secondary:hover {
+    background: var(--border-secondary);
+    color: var(--text-primary);
+    border-color: var(--border-secondary);
+}
+
+.btn-outline-primary {
+    color: var(--accent-primary);
+    border: 2px solid var(--accent-primary);
+    background: transparent;
+}
+
+.btn-outline-primary:hover, .btn-outline-primary.active {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: var(--text-primary);
+}
+
+.btn-outline-success {
+    color: var(--accent-secondary);
+    border: 2px solid var(--accent-secondary);
+    background: transparent;
+}
+
+.btn-outline-success:hover, .btn-outline-success.active {
+    background: var(--accent-secondary);
+    border-color: var(--accent-secondary);
+    color: var(--text-primary);
+}
+
+/* Smooth navigation */
+.nav-pills {
+    background: var(--bg-tertiary) !important;
+    border-radius: 0.75rem;
+    padding: 0.5rem;
+    gap: 0.5rem;
+}
+
+.nav-pills .nav-link {
+    color: var(--text-secondary);
+    font-weight: 500;
+    transition: all 0.15s ease-out;
+    border-radius: 0.5rem;
+    margin: 0;
+    flex: 1;
+}
+
+/* Override Bootstrap nav-fill to add gaps */
+.nav-pills.nav-fill .nav-item {
+    margin: 0 0.25rem;
+}
+
+.nav-pills.nav-fill .nav-item:first-child {
+    margin-left: 0;
+}
+
+.nav-pills.nav-fill .nav-item:last-child {
+    margin-right: 0;
+}
+
+.nav-pills .nav-link:hover {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+}
+
+.nav-pills .nav-link.active {
+    background: var(--accent-primary) !important;
+    color: var(--text-primary) !important;
+    box-shadow: 0 2px 8px rgba(59, 130, 246, 0.25);
+}
+
+/* Robust input styling */
+.form-control {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-primary);
+    font-size: 0.925rem;
+    transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
+}
+
+.form-control:focus {
+    background: var(--bg-secondary);
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    color: var(--text-primary);
+}
+
+.form-control::placeholder {
+    color: var(--text-muted);
+}
+
+.input-group-text {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+}
+
+/* Badge improvements */
+.badge {
+    font-weight: 500;
+    font-size: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+}
+
+.badge.bg-success {
+    background: var(--accent-secondary) !important;
+    color: var(--text-primary);
+}
+
+.badge.bg-primary {
+    background: var(--accent-primary) !important;
+    color: var(--text-primary);
+}
+
+.badge.bg-secondary {
+    background: var(--bg-tertiary) !important;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-primary);
+}
+
+/* Alert improvements */
+.alert {
+    border: none;
+    border-radius: 0.75rem;
+    font-weight: 500;
+}
+
+.alert-success {
+    background: rgba(16, 185, 129, 0.1);
+    color: var(--accent-secondary);
+    border: 1px solid rgba(16, 185, 129, 0.2);
+}
+
+/* Toast styling */
+.toast {
+    backdrop-filter: blur(10px);
+    background: rgba(30, 41, 59, 0.95);
+    border: 1px solid var(--border-primary);
+    color: var(--text-primary);
+}
+
+/* Animation improvements */
+.spinner-grow {
+    animation-duration: 1.5s;
+}
+
+/* Stable device card styling */
+.device-card {
+    transition: border-color 0.2s ease-out, box-shadow 0.2s ease-out;
+    border: 1px solid var(--border-primary);
+    background: var(--bg-secondary);
+}
+
+.device-card:hover {
+    border-color: var(--accent-primary);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.device-card.connected {
+    border-color: var(--accent-secondary);
+    background: rgba(16, 185, 129, 0.08);
+}
+
+.device-card.offline {
+    opacity: 0.6;
+    background: var(--bg-primary);
+}
+
+.device-card h6 {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.device-card .text-muted {
+    color: var(--text-muted) !important;
+}
+
+/* Header styling */
+.app-title {
+    color: var(--text-primary);
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.app-icon {
+    color: var(--accent-primary);
+}
+
+.app-subtitle {
+    color: var(--text-secondary);
+}
+
+/* Status indicators */
+.status-online {
+    color: var(--accent-secondary);
+}
+
+.status-offline {
+    color: var(--text-muted);
+}
+
+/* Icon styling */
+.bi {
+    vertical-align: -0.125em;
+}
+
+/* Improved text contrast for small elements */
+small {
+    color: var(--text-muted);
+    font-size: 0.825rem;
+}
+
+.text-success {
+    color: var(--accent-secondary) !important;
+}
+
+.text-primary {
+    color: var(--accent-primary) !important;
+}
+
+.text-danger {
+    color: var(--accent-danger) !important;
+}
+
+.text-warning {
+    color: var(--accent-warning) !important;
+}
+
+/* Clean focus states and interactive elements */
+button:focus-visible, input:focus-visible, .nav-link:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+    border-radius: 0.375rem;
+}
+
+.btn:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+}
+
+.nav-link:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+/* Remove any unwanted transforms and ensure stability */
+.btn:not(:active):not(:focus) {
+    transform: none;
+}
+
+.card:not(:hover) {
+    transform: none;
+}
+
+/* Ensure consistent button states */
+.btn:disabled, .btn.disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none !important;
+    box-shadow: none !important;
+    filter: none !important;
+}
+
+/* Loading states without jitter */
+.loading {
+    position: relative;
+    overflow: hidden;
+}
+
+.loading::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+    animation: shimmer 2s infinite ease-in-out;
+}
+
+@keyframes shimmer {
+    0% { left: -100%; }
+    100% { left: 100%; }
+}

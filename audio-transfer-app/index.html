@@ -1,13 +1,294 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>audio-transfer-app</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Transfer App</title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link href="styles.css" rel="stylesheet">
+</head>
+<body class="bg-dark text-light">
+    <div class="container-fluid">
+        <!-- Header -->
+        <header class="text-center py-5">
+            <h1 class="display-4 fw-bold mb-3 app-title">
+                <i class="bi bi-broadcast me-3 app-icon"></i>Audio Transfer
+            </h1>
+            <p class="lead app-subtitle">Stream and play audio across your local network</p>
+        </header>
+
+        <!-- Tab Navigation -->
+        <div class="row justify-content-center mb-4">
+            <div class="col-12 col-md-8 col-lg-6 tab-container">
+                <ul class="nav nav-pills nav-fill bg-secondary rounded-3 p-2" id="mainTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="stream-tab" data-bs-toggle="pill" data-bs-target="#stream" type="button" role="tab">
+                            <i class="bi bi-broadcast me-2"></i>Stream
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="play-tab" data-bs-toggle="pill" data-bs-target="#play" type="button" role="tab">
+                            <i class="bi bi-play-circle me-2"></i>Play
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="support-tab" data-bs-toggle="pill" data-bs-target="#support" type="button" role="tab">
+                            <i class="bi bi-question-circle me-2"></i>Support
+                        </button>
+                    </li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Tab Content -->
+        <div class="tab-content" id="mainTabContent">
+            <!-- Stream Tab -->
+            <div class="tab-pane fade show active" id="stream" role="tabpanel">
+                <div class="row justify-content-center">
+                    <div class="col-12 col-lg-10">
+                        <div class="card bg-secondary border-0 shadow-lg">
+                            <div class="card-body p-4">
+                                <h2 class="h3 mb-4 text-center">Start Audio Stream</h2>
+                                
+                                <!-- Server Status -->
+                                <div class="card border-primary mb-4" style="background: var(--bg-primary); border-color: var(--border-primary) !important;">
+                                    <div class="card-body">
+                                        <div class="d-flex justify-content-between align-items-center mb-3">
+                                            <div class="d-flex align-items-center">
+                                                <div class="rounded-3 p-2 me-3" style="background: var(--accent-primary);">
+                                                    <i class="bi bi-router fs-5" style="color: var(--text-primary);"></i>
+                                                </div>
+                                                <div>
+                                                    <h5 class="mb-1" style="color: var(--text-primary);">Server Address</h5>
+                                                    <small style="color: var(--text-muted);">Your streaming endpoint</small>
+                                                </div>
+                                            </div>
+                                            <span class="badge bg-secondary" id="serverStatus">OFFLINE</span>
+                                        </div>
+                                        <div class="row">
+                                            <div class="col-sm-6">
+                                                <div class="d-flex justify-content-between">
+                                                    <span class="text-muted">Local IP:</span>
+                                                    <code class="bg-dark px-2 py-1 rounded" id="localIP">Not detected</code>
+                                                </div>
+                                            </div>
+                                            <div class="col-sm-6">
+                                                <div class="d-flex justify-content-between">
+                                                    <span class="text-muted">Device:</span>
+                                                    <span id="deviceName">My Device</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Audio Source Selection -->
+                                <div class="mb-4">
+                                    <h5 class="mb-3">Audio Source</h5>
+                                    <div class="row g-3">
+                                        <div class="col-md-4">
+                                            <input type="radio" class="btn-check" name="audioSource" id="microphone" value="microphone" checked>
+                                            <label class="btn btn-outline-primary w-100 p-3" for="microphone">
+                                                <i class="bi bi-mic-fill d-block fs-3 mb-2"></i>
+                                                <div class="fw-semibold">Microphone</div>
+                                                <small class="text-muted">Stream from microphone input</small>
+                                            </label>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <input type="radio" class="btn-check" name="audioSource" id="system" value="system">
+                                            <label class="btn btn-outline-primary w-100 p-3" for="system">
+                                                <i class="bi bi-pc-display-horizontal d-block fs-3 mb-2"></i>
+                                                <div class="fw-semibold">System Audio</div>
+                                                <small class="text-muted">Stream computer audio</small>
+                                            </label>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <input type="radio" class="btn-check" name="audioSource" id="file" value="file">
+                                            <label class="btn btn-outline-primary w-100 p-3" for="file">
+                                                <i class="bi bi-file-music-fill d-block fs-3 mb-2"></i>
+                                                <div class="fw-semibold">Audio File</div>
+                                                <small class="text-muted">Stream from audio file</small>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Quality Settings -->
+                                <div class="mb-4">
+                                    <h5 class="mb-3">Audio Quality</h5>
+                                    <div class="row g-2">
+                                        <div class="col-6 col-md-3">
+                                            <input type="radio" class="btn-check" name="quality" id="low" value="low">
+                                            <label class="btn btn-outline-success w-100" for="low">
+                                                <div class="fw-semibold">Low</div>
+                                                <small class="d-block">64kbps</small>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <input type="radio" class="btn-check" name="quality" id="medium" value="medium" checked>
+                                            <label class="btn btn-outline-success w-100" for="medium">
+                                                <div class="fw-semibold">Medium</div>
+                                                <small class="d-block">128kbps</small>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <input type="radio" class="btn-check" name="quality" id="high" value="high">
+                                            <label class="btn btn-outline-success w-100" for="high">
+                                                <div class="fw-semibold">High</div>
+                                                <small class="d-block">256kbps</small>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <input type="radio" class="btn-check" name="quality" id="ultra" value="ultra">
+                                            <label class="btn btn-outline-success w-100" for="ultra">
+                                                <div class="fw-semibold">Ultra</div>
+                                                <small class="d-block">320kbps</small>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Stream Controls -->
+                                <div class="text-center">
+                                    <button class="btn btn-primary btn-lg px-5" id="startStreamBtn">
+                                        <i class="bi bi-play-fill me-2"></i>Start Streaming
+                                    </button>
+                                    <button class="btn btn-danger btn-lg px-5 d-none" id="stopStreamBtn">
+                                        <i class="bi bi-stop-fill me-2"></i>Stop Streaming
+                                    </button>
+                                </div>
+
+                                <!-- Live Indicator -->
+                                <div class="alert alert-success mt-4 d-none" id="liveIndicator">
+                                    <div class="d-flex align-items-center justify-content-center">
+                                        <div class="spinner-grow spinner-grow-sm text-success me-2" role="status"></div>
+                                        <strong>LIVE STREAMING</strong>
+                                    </div>
+                                    <div class="text-center mt-2">
+                                        <i class="bi bi-people me-1"></i>
+                                        <span id="connectedCount">0</span> device(s) connected
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Play Tab -->
+            <div class="tab-pane fade" id="play" role="tabpanel">
+                <div class="row justify-content-center">
+                    <div class="col-12 col-lg-10">
+                        <div class="card bg-secondary border-0 shadow-lg">
+                            <div class="card-body p-4">
+                                <h2 class="h3 mb-4 text-center">Connect & Play</h2>
+                                
+                                <!-- Search and Refresh -->
+                                <div class="row mb-4">
+                                    <div class="col-md-9">
+                                        <div class="input-group">
+                                            <span class="input-group-text bg-dark border-secondary">
+                                                <i class="bi bi-search"></i>
+                                            </span>
+                                            <input type="text" class="form-control bg-dark border-secondary text-light" 
+                                                   placeholder="Search devices or IP addresses..." id="deviceSearch">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <button class="btn btn-outline-primary w-100" id="refreshDevices">
+                                            <i class="bi bi-arrow-clockwise me-2"></i>Refresh
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <!-- Device List -->
+                                <div class="mb-4">
+                                    <div class="d-flex justify-content-between align-items-center mb-3">
+                                        <h5 class="mb-0">Available Devices</h5>
+                                        <span class="badge bg-primary" id="onlineDeviceCount">0 online</span>
+                                    </div>
+                                    
+                                    <div id="deviceList">
+                                        <!-- Devices will be populated here -->
+                                    </div>
+                                </div>
+
+                                <!-- Manual Connection -->
+                                <div class="card bg-dark border-secondary">
+                                    <div class="card-body">
+                                        <h5 class="mb-3">Manual Connection</h5>
+                                        <p class="text-muted mb-3">Connect to a device by entering its IP address and port</p>
+                                        <div class="row">
+                                            <div class="col-md-8">
+                                                <input type="text" class="form-control bg-secondary border-secondary text-light" 
+                                                       placeholder="192.168.1.100:3001" id="manualIP">
+                                            </div>
+                                            <div class="col-md-4">
+                                                <button class="btn btn-primary w-100" id="manualConnect">Connect</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Support Tab -->
+            <div class="tab-pane fade" id="support" role="tabpanel">
+                <div class="row justify-content-center">
+                    <div class="col-12 col-lg-8">
+                        <div class="card bg-secondary border-0 shadow-lg">
+                            <div class="card-body p-4">
+                                <h2 class="h3 mb-4 text-center">Support & Help</h2>
+                                
+                                <div class="row">
+                                    <div class="col-md-6 mb-4">
+                                        <div class="card bg-dark border-secondary h-100">
+                                            <div class="card-body text-center">
+                                                <i class="bi bi-question-circle-fill text-primary fs-1 mb-3"></i>
+                                                <h5>How to Use</h5>
+                                                <p class="text-muted">Learn how to stream and connect to audio devices</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6 mb-4">
+                                        <div class="card bg-dark border-secondary h-100">
+                                            <div class="card-body text-center">
+                                                <i class="bi bi-gear-fill text-success fs-1 mb-3"></i>
+                                                <h5>Settings</h5>
+                                                <p class="text-muted">Configure audio quality and network settings</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="text-center">
+                                    <p class="text-muted">Audio Transfer App v1.0.0</p>
+                                    <p class="text-muted">Built with JavaScript + Bootstrap</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Socket.IO Client -->
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- Main App JS -->
+    <script src="app.js"></script>
+</body>
 </html>
