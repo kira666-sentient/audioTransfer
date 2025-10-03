@@ -252,6 +252,8 @@ class AudioTransferServer {
                         timestamp: data.timestamp || Date.now(),
                         quality: streamInfo.streamConfig?.quality,
                         channel: data.channel || 0,
+                        channels: data.channels || 1,
+                        sampleRate: data.sampleRate || 48000,
                         data: normalizedArrayBuffer
                     };
                     for (const [clientId, clientInfo] of this.connectedClients.entries()) {

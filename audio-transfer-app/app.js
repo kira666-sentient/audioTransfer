@@ -19,7 +19,7 @@ class AudioTransferApp {
         this.audioQueue = [];
         this.isProcessingQueue = false;
         this.nextPlayTime = 0;
-        this.audioLatency = 0.1; // seconds
+    this.audioLatency = 0.2; // seconds, provide a bit more cushion for jitter
     // Packet counter for received audioStream events
     this.packetCount = 0;
 
@@ -299,7 +299,8 @@ class AudioTransferApp {
             this.audioContext = null;
         }
 
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    // Prefer a fixed 48kHz rate to reduce resampling mismatch across devices
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
 
         // create source
         this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
@@ -312,7 +313,7 @@ class AudioTransferApp {
                 this.workletNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
                 this.workletNode.port.onmessage = (e) => {
                     if (e.data && e.data.audioBuffer) {
-                        this.sendAudioToServer(e.data.audioBuffer);
+                        this.sendAudioToServer(e.data.audioBuffer, 0, this.audioContext.sampleRate, 1);
                     }
                 };
                 this.sourceNode.connect(this.workletNode);
@@ -331,17 +332,37 @@ class AudioTransferApp {
 
         // fallback: ScriptProcessor
         this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+        // Accumulate into fixed 20ms packets for consistent network pacing
+        const framesPerPacket = Math.round(this.audioContext.sampleRate * 0.02);
+        this._pendingChunks = [];
+        this._pendingLength = 0; // in frames
         this.processorNode.onaudioprocess = (e) => {
             if (!this.isStreaming) return;
-            const now = Date.now();
-            if (now - this.lastAudioSent < this.audioSendInterval) return;
-            this.lastAudioSent = now;
-
             const input = e.inputBuffer.getChannelData(0);
-            // copy to Float32Array
             const copy = new Float32Array(input.length);
             copy.set(input);
-            this.sendAudioToServer(copy.buffer);
+            this._pendingChunks.push(copy);
+            this._pendingLength += copy.length;
+
+            while (this._pendingLength >= framesPerPacket) {
+                const out = new Float32Array(framesPerPacket);
+                let offset = 0;
+                while (offset < framesPerPacket && this._pendingChunks.length) {
+                    const head = this._pendingChunks[0];
+                    const need = framesPerPacket - offset;
+                    if (head.length <= need) {
+                        out.set(head, offset);
+                        offset += head.length;
+                        this._pendingChunks.shift();
+                    } else {
+                        out.set(head.subarray(0, need), offset);
+                        this._pendingChunks[0] = head.subarray(need);
+                        offset += need;
+                    }
+                }
+                this._pendingLength -= framesPerPacket;
+                this.sendAudioToServer(out.buffer, 0, this.audioContext.sampleRate, 1);
+            }
         };
         this.sourceNode.connect(this.processorNode);
         // Ensure the processor is pulled by connecting to a muted gain -> destination
@@ -354,26 +375,43 @@ class AudioTransferApp {
     }
 
     // Worklet code served as blob URL
-    createAudioWorkletScript() {
+        createAudioWorkletScript() {
         const workletScript = `
       class AudioProcessor extends AudioWorkletProcessor {
         constructor() {
           super();
-          this.lastSent = 0;
-          this.intervalMs = 20; // send every ~20ms
+                    // Accumulate to ~20ms frames based on sampleRate to avoid jitter
+                    this.framesPerPacket = Math.round(sampleRate * 0.02);
+                    this.pending = [];
+                    this.pendingLength = 0; // in frames
         }
         process(inputs) {
           const input = inputs[0];
           if (!input || !input[0]) return true;
-          const now = currentTime * 1000; // ms
-          if (now - this.lastSent < this.intervalMs) return true;
-          this.lastSent = now;
-          const channelData = input[0];
-          // copy to Float32Array
-          const copy = new Float32Array(channelData.length);
-          copy.set(channelData);
-          // post as transferable
-          this.port.postMessage({ audioBuffer: copy.buffer }, [copy.buffer]);
+                    const channelData = input[0]; // mono
+                    const copy = new Float32Array(channelData.length);
+                    copy.set(channelData);
+                    this.pending.push(copy);
+                    this.pendingLength += copy.length;
+                    while (this.pendingLength >= this.framesPerPacket) {
+                        const out = new Float32Array(this.framesPerPacket);
+                        let offset = 0;
+                        while (offset < this.framesPerPacket && this.pending.length) {
+                            const head = this.pending[0];
+                            const need = this.framesPerPacket - offset;
+                            if (head.length <= need) {
+                                out.set(head, offset);
+                                offset += head.length;
+                                this.pending.shift();
+                            } else {
+                                out.set(head.subarray(0, need), offset);
+                                this.pending[0] = head.subarray(need);
+                                offset += need;
+                            }
+                        }
+                        this.pendingLength -= this.framesPerPacket;
+                        this.port.postMessage({ audioBuffer: out.buffer }, [out.buffer]);
+                    }
           return true;
         }
       }
@@ -383,9 +421,11 @@ class AudioTransferApp {
         return URL.createObjectURL(blob);
     }
 
-    sendAudioToServer(arrayBuffer) {
+    sendAudioToServer(arrayBuffer, channel = 0, sampleRate = 48000, channels = 1) {
         this.socket.emit('audioData', {
-            channel: 0,
+            channel,
+            channels,
+            sampleRate,
             timestamp: Date.now(),
             data: arrayBuffer
         });
@@ -395,7 +435,7 @@ class AudioTransferApp {
     async startListening(sourceId) {
         // Ensure AudioContext exists and is resumed
         if (!this.audioContext) {
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
         }
         if (this.audioContext.state === 'suspended') {
             await this.audioContext.resume();
@@ -496,7 +536,10 @@ class AudioTransferApp {
                 src.connect(this.playbackGainNode);
 
                 const now = this.audioContext.currentTime;
-                if (this.nextPlayTime <= now) this.nextPlayTime = now + this.audioLatency;
+                // If we're too close to now and queue is shallow, bump forward to rebuild cushion
+                if (this.nextPlayTime <= now || (this.nextPlayTime - now) < 0.05) {
+                    this.nextPlayTime = now + this.audioLatency;
+                }
                 src.start(this.nextPlayTime);
                 this.nextPlayTime += buffer.duration;
 
