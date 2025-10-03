@@ -16,14 +16,22 @@ class AudioTransferServer {
         this.server = createServer(this.app);
         this.io = new Server(this.server, {
             cors: {
-                origin: "*",
-                methods: ["GET", "POST"]
+                origin: process.env.ALLOWED_ORIGINS ? 
+                    process.env.ALLOWED_ORIGINS.split(',') : 
+                    ["http://localhost:3001", "http://127.0.0.1:3001"],
+                methods: ["GET", "POST"],
+                credentials: false
             }
         });
         
         this.connectedClients = new Map();
         this.streamingClients = new Map();
         this.port = process.env.PORT || 3001;
+        
+        // Rate limiting for audio data
+        this.audioDataRateLimit = new Map();
+        this.maxAudioPacketsPerSecond = 60; // Increased for real-time audio quality (50 + buffer)
+        this.rateLimitWarnings = new Map(); // Track warnings sent to clients
         
         this.setupMiddleware();
         this.setupRoutes();
@@ -88,6 +96,17 @@ class AudioTransferServer {
         this.io.on('connection', (socket) => {
             console.log(`Client connected: ${socket.id}`);
             
+            // helper to broadcast listener count for each streamer
+            const broadcastListenerCounts = () => {
+                const counts = {};
+                for (const client of this.connectedClients.values()) {
+                    if (client.listeningTo) {
+                        counts[client.listeningTo] = (counts[client.listeningTo] || 0) + 1;
+                    }
+                }
+                this.io.emit('listenerCounts', counts);
+            };
+
             // Register client
             const clientInfo = {
                 id: socket.id,
@@ -102,72 +121,195 @@ class AudioTransferServer {
 
             // Handle streaming events
             socket.on('startStreaming', (data) => {
+                // Validate streaming configuration
+                if (!data || typeof data !== 'object') {
+                    console.warn(`Invalid streaming config from ${socket.id}`);
+                    return;
+                }
+                
+                const validSources = ['microphone', 'system', 'file'];
+                const validQualities = ['low', 'medium', 'high', 'ultra'];
+                
+                if (!validSources.includes(data.source) || !validQualities.includes(data.quality)) {
+                    console.warn(`Invalid streaming parameters from ${socket.id}`);
+                    return;
+                }
+                
                 console.log(`Client ${socket.id} started streaming:`, data);
                 
                 // Update client info
                 const client = this.connectedClients.get(socket.id);
                 if (client) {
-                    client.name = data.deviceName || client.name;
-                    client.type = this.detectDeviceType(data.deviceName);
-                    client.isStreaming = true;
-                    client.streamConfig = {
-                        source: data.source,
-                        quality: data.quality,
-                        startedAt: new Date()
-                    };
-                }
-                
-                this.streamingClients.set(socket.id, {
-                    ...clientInfo,
+                    this.streamingClients.set(socket.id, {
+                    ...client,
                     streamConfig: data
                 });
                 
                 // Notify other clients
                 socket.broadcast.emit('streamStarted', {
                     clientId: socket.id,
-                    clientName: client.name,
-                    config: data
+                    clientName: client?.name,
+                    config: {
+                        source: data.source,
+                        quality: data.quality
+                    }
                 });
                 
                 this.broadcastDeviceList();
+                }
             });
 
             socket.on('stopStreaming', () => {
                 console.log(`Client ${socket.id} stopped streaming`);
-                
+
                 const client = this.connectedClients.get(socket.id);
                 if (client) {
                     client.isStreaming = false;
                     delete client.streamConfig;
                 }
-                
+
                 this.streamingClients.delete(socket.id);
-                
+
                 // Notify other clients
                 socket.broadcast.emit('streamStopped', {
                     clientId: socket.id,
                     clientName: client?.name
                 });
-                
+
                 this.broadcastDeviceList();
             });
 
             socket.on('audioData', (data) => {
-                // Relay audio data to connected clients
-                socket.broadcast.emit('audioStream', {
-                    sourceId: socket.id,
-                    ...data
+                // Debug: log when receiving audioData from client
+                if (!socket._audioReceiveCounter) socket._audioReceiveCounter = 0;
+                socket._audioReceiveCounter++;
+                if (socket._audioReceiveCounter % 20 === 0) {
+                    const sz = data?.data?.byteLength || data?.data?.length || 0;
+                    console.log(`🛬 [server] Received audioData from ${socket.id} | size: ${sz}`);
+                }
+                // Rate limiting for audio data
+                const clientId = socket.id;
+                const now = Date.now();
+                
+                if (!this.audioDataRateLimit.has(clientId)) {
+                    this.audioDataRateLimit.set(clientId, { count: 0, lastReset: now });
+                }
+                
+                const rateData = this.audioDataRateLimit.get(clientId);
+                
+                // Reset counter every second
+                if (now - rateData.lastReset > 1000) {
+                    rateData.count = 0;
+                    rateData.lastReset = now;
+                }
+                
+                // Check rate limit
+                if (rateData.count > this.maxAudioPacketsPerSecond) {
+                    // Send warning to client instead of spamming console
+                    if (!this.rateLimitWarnings.has(clientId) || 
+                        now - this.rateLimitWarnings.get(clientId) > 5000) {
+                        socket.emit('rateLimitWarning');
+                        this.rateLimitWarnings.set(clientId, now);
+                    }
+                    return;
+                }
+                
+                rateData.count++;
+                
+                // Validate and normalize audio data (accept Buffer/TypedArray/ArrayBuffer/Array)
+                if (!data || data.data == null) {
+                    return; // Silently drop invalid data instead of logging
+                }
+                let normalizedArrayBuffer = null;
+                try {
+                    const payload = data.data;
+                    if (payload instanceof ArrayBuffer) {
+                        normalizedArrayBuffer = payload;
+                    } else if (Array.isArray(payload)) {
+                        // array of numbers -> Float32Array -> ArrayBuffer
+                        const f32 = new Float32Array(payload);
+                        normalizedArrayBuffer = f32.buffer;
+                    } else if (Buffer.isBuffer(payload)) {
+                        // Node Buffer -> slice underlying ArrayBuffer to exact view
+                        normalizedArrayBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+                    } else if (ArrayBuffer.isView(payload)) {
+                        // TypedArray/DataView -> normalize to ArrayBuffer slice
+                        normalizedArrayBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+                    } else {
+                        return; // unsupported type
+                    }
+                } catch (e) {
+                    return;
+                }
+                
+                // Relay audio data to all listening clients with improved metadata
+                const streamInfo = this.streamingClients.get(socket.id);
+                if (streamInfo) {
+                    // Send audioStream only to clients listening to this source
+                    const payload = {
+                        sourceId: socket.id,
+                        sourceName: this.connectedClients.get(socket.id)?.name,
+                        timestamp: data.timestamp || Date.now(),
+                        quality: streamInfo.streamConfig?.quality,
+                        channel: data.channel || 0,
+                        data: normalizedArrayBuffer
+                    };
+                    for (const [clientId, clientInfo] of this.connectedClients.entries()) {
+                        if (clientInfo.listeningTo === socket.id) {
+                            this.io.to(clientId).emit('audioStream', payload);
+                        }
+                    }
+                }
+            });
+
+            socket.on('joinAsListener', (sourceId) => {
+                console.log(`${socket.id} joining as listener to ${sourceId}`);
+                const client = this.connectedClients.get(socket.id);
+                if (client) {
+                    // Always update the target source
+                    client.type = 'listener';
+                    client.listeningTo = sourceId;
+                }
+                
+                // Notify the streaming client about new listener
+                if (this.streamingClients.has(sourceId)) {
+                    this.io.to(sourceId).emit('listenerJoined', {
+                        listenerId: socket.id,
+                        listenerName: client?.name
+                    });
+                }
+                
+                socket.emit('joinedAsListener', {
+                    sourceId: sourceId,
+                    sourceName: this.connectedClients.get(sourceId)?.name
                 });
+
+                // 🔸 update everyone with new listener counts
+                broadcastListenerCounts();
+            });
+
+            socket.on('leaveAsListener', () => {
+                const client = this.connectedClients.get(socket.id);
+                if (client && client.listeningTo) {
+                    // Notify the streaming client
+                    this.io.to(client.listeningTo).emit('listenerLeft', {
+                        listenerId: socket.id,
+                        listenerName: client.name
+                    });
+                    delete client.listeningTo;
+                    client.type = 'unknown';
+                }
+
+                // 🔸 update everyone with new listener counts
+                broadcastListenerCounts();
             });
 
             socket.on('discoverDevices', () => {
-                console.log(`Device discovery requested by ${socket.id}`);
+                // Send device list directly without logging
                 socket.emit('deviceList', this.getDeviceList());
             });
 
             socket.on('connectToDevice', (targetDeviceId) => {
-                console.log(`${socket.id} attempting to connect to ${targetDeviceId}`);
-                
                 const targetDevice = this.connectedClients.get(targetDeviceId);
                 if (targetDevice && this.streamingClients.has(targetDeviceId)) {
                     // Successful connection
@@ -226,7 +368,12 @@ class AudioTransferServer {
                 
                 this.connectedClients.delete(socket.id);
                 this.streamingClients.delete(socket.id);
+                this.audioDataRateLimit.delete(socket.id); // Clean up rate limiting data
+                this.rateLimitWarnings.delete(socket.id); // Clean up warning tracking
                 this.broadcastDeviceList();
+
+                // 🔸 update everyone with new listener counts
+                broadcastListenerCounts();
             });
         });
     }
@@ -247,6 +394,16 @@ class AudioTransferServer {
     broadcastDeviceList() {
         const deviceList = this.getDeviceList();
         this.io.emit('deviceList', deviceList);
+    }
+
+    sanitizeDeviceName(deviceName) {
+        if (!deviceName || typeof deviceName !== 'string') return null;
+        
+        // Remove potentially dangerous characters and limit length
+        return deviceName
+            .replace(/[<>"'&]/g, '') // Remove HTML/script chars
+            .trim()
+            .substring(0, 50); // Limit length
     }
 
     detectDeviceType(deviceName) {

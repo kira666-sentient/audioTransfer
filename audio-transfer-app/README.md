@@ -1,52 +1,138 @@
-# Audio Transfer App# React + TypeScript + Vite
+# Audio Transfer App
 
+A simple and elegant audio streaming application built with **JavaScript + Bootstrap + Node.js**. Stream audio across your local network with a clean, responsive interface.
 
+## 🚀 Features
 
-A simple and elegant audio streaming application built with **JavaScript + Bootstrap + Node.js**. Stream audio across your local network with a clean, responsive interface.This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
-
-
-
-## 🚀 FeaturesCurrently, two official plugins are available:
-
-
-
-- **Real-time Audio Streaming** - Stream from microphone, system audio, or files- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-
-- **Device Discovery** - Automatically find devices on your network- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
+- **Real-time Audio Streaming** - Stream from microphone, system audio, or files
+- **Device Discovery** - Automatically find devices on your network
 - **Multiple Quality Settings** - From 64kbps to 320kbps
-
-- **Responsive Design** - Works on desktop, tablet, and mobile## React Compiler
-
+- **Responsive Design** - Works on desktop, tablet, and mobile
 - **Bootstrap UI** - Clean, modern interface with dark theme
+- **Socket.IO Backend** - Real-time communication
+- **Multi-listener Support** - Multiple devices can listen to one stream
 
-- **Socket.IO Backend** - Real-time communicationThe React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 🛠️ Technology Stack
 
-
-
-## 🛠️ Technology Stack## Expanding the ESLint configuration
-
-
-
-- **Frontend**: HTML5, CSS3, JavaScript ES6+, Bootstrap 5If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
+- **Frontend**: HTML5, CSS3, JavaScript ES6+, Bootstrap 5
 - **Backend**: Node.js, Express, Socket.IO
+- **Audio**: Web Audio API, WebRTC
+- **Styling**: Bootstrap 5 + Custom CSS
 
-- **Audio**: Web Audio API, WebRTC```js
+## 📦 Installation
 
-- **Styling**: Bootstrap 5 + Custom CSSexport default defineConfig([
-
-  globalIgnores(['dist']),
-
-## 📦 Installation  {
-
-    files: ['**/*.{ts,tsx}'],
-
-1. **Clone the repository**    extends: [
-
-   ```bash      // Other configs...
-
+1. **Clone the repository**
+   ```bash
    git clone <repository-url>
+   cd audio-transfer-app
+   ```
+
+2. **Install dependencies**
+   ```bash
+   npm install
+   ```
+
+3. **Start the server**
+   ```bash
+   npm start
+   ```
+
+4. **Open in browser**
+   - Local: `http://localhost:3001`
+   - Network: `http://[your-ip]:3001`
+
+## 🎵 How to Use
+
+### Streaming Audio
+1. Go to the **Stream** tab
+2. Select audio source (Microphone/System Audio)
+3. Choose quality setting (Low/Medium/High/Ultra)
+4. Click **Start Streaming**
+5. Share your network IP with others
+
+### Listening to Audio
+1. Go to the **Play** tab
+2. Click **Refresh** to discover devices
+3. Click **Listen** on devices showing "🔴 LIVE"
+4. Audio will play automatically
+
+## 📱 Supported Platforms
+
+### Audio Sources
+- **Microphone**: All modern browsers
+- **System Audio**: Chrome 72+, Edge 79+
+- **File Upload**: Coming soon
+
+### Browsers
+- Chrome 72+ (Full support)
+- Firefox 66+ (Microphone only)
+- Safari 13+ (Microphone only)
+- Edge 79+ (Full support)
+
+## 🔧 Configuration
+
+### Environment Variables
+```bash
+PORT=3001  # Server port (default: 3001)
+```
+
+### Audio Quality Settings
+- **Low**: 64kbps, 22.05kHz
+- **Medium**: 128kbps, 44.1kHz (default)
+- **High**: 256kbps, 44.1kHz
+- **Ultra**: 320kbps, 48kHz
+
+## 🏗️ Architecture
+
+```
+┌─────────────┐    WebSocket    ┌─────────────┐
+│   Client A  │◄────────────────┤   Server    │
+│ (Streamer)  │                 │ (Node.js)   │
+└─────────────┘                 └─────────────┘
+                                       ▲
+                WebSocket              │
+┌─────────────┐    Audio         ┌─────▼─────┐
+│   Client B  │◄─────────────────│   Client C│
+│ (Listener)  │     Relay        │(Listener) │
+└─────────────┘                  └───────────┘
+```
+
+## 📚 Documentation
+
+- [Server Documentation](./docs/SERVER.md) - Complete server-side documentation
+- [Client Documentation](./docs/CLIENT.md) - Client-side functionality
+- [UI Documentation](./docs/HTML.md) - HTML structure and components
+
+## 🐛 Troubleshooting
+
+### Audio Issues
+- **No microphone access**: Check browser permissions
+- **System audio not working**: Use Chrome or Edge browser
+- **Audio choppy**: Lower quality setting or check network
+
+### Connection Issues
+- **Can't find devices**: Ensure all devices are on same network
+- **Connection failed**: Check firewall settings
+- **Port already in use**: Change PORT environment variable
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+## 📄 License
+
+ISC License - see LICENSE file for details
+
+## 🙏 Acknowledgments
+
+- Bootstrap for the UI framework
+- Socket.IO for real-time communication
+- Web Audio API for audio processing
+- Node.js community for excellent packages
 
    cd audio-transfer-app      // Remove tseslint.configs.recommended and replace with this
 
