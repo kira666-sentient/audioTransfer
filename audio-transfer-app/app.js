@@ -1,672 +1,642 @@
-// app.js - Fixed and simplified Audio Transfer client
+// app.js - Final tuned client: removed experimental toggles, fixed channel handling (stereo / dual-mono / mono), high-quality resampling
 
 class AudioTransferApp {
-    constructor() {
-        // Socket + audio state
-        this.socket = null;
-        this.mediaStream = null;
-        this.audioContext = null;
-        this.sourceNode = null;
-        this.processorNode = null; // ScriptProcessor fallback
-        this.workletNode = null;
-        this.isStreaming = false;
-        this.isListening = false;
-    // A muted gain to keep processing nodes pulled without feedback
-    this.silentGainNode = null;
+  constructor() {
+    // socket + stream
+    this.socket = null;
+    this.mediaStream = null;
 
-    // Playback state
-        this.playbackGainNode = null;
-        this.audioQueue = [];
-        this.isProcessingQueue = false;
-        this.nextPlayTime = 0;
-    this.audioLatency = 0.2; // seconds, provide a bit more cushion for jitter
-    // Packet counter for received audioStream events
+    // capture
+    this.captureContext = null;
+    this.captureSourceNode = null;
+    this.workletNode = null;
+    this.processorNode = null;
+    this.silentGainNode = null;
+    this._sendSeq = 0;
+
+    // playback
+    this.audioContext = null;
+    this.playbackGain = null;
+    this.audioQueue = [];
+    this.isProcessingQueue = false;
+    this.nextPlayTime = 0;
+    this.fixedLatency = 0.12; // seconds - low and stable
+    this.activeSources = new Set();
+
+    // state
+    this.isStreaming = false;
+    this.isListening = false;
+    this.listeningToSource = null;
     this.packetCount = 0;
 
-        // Rate limiting
-        this.lastAudioSent = 0;
-        this.audioSendInterval = 20; // ms
+    document.addEventListener('DOMContentLoaded', () => this.init());
+  }
 
-        document.addEventListener('DOMContentLoaded', () => this.init());
-    }
+  init() {
+    this.initSocket();
+    this.setupEventListeners();
+    this.detectLocalIP();
+  }
 
-    async init() {
-        this.initSocket();
-        this.setupEventListeners();
-        await this.detectLocalIP();
-        console.log('AudioTransferApp initialized');
-    }
+  initSocket() {
+    if (this.socket) return;
+    this.socket = io();
 
-    initSocket() {
-        // expecting socket.io client already loaded on page <script src="/socket.io/socket.io.js"></script>
-        this.socket = io();
+    this.socket.on('connect', () => {
+      const s = document.getElementById('serverStatus');
+      if (s && !this.isStreaming && !this.isListening) { s.textContent = 'ONLINE'; s.className = 'badge bg-success'; }
+      this.socket.emit('discoverDevices');
+    });
 
-        this.socket.on('connect', () => {
-            console.log('Connected to server', this.socket.id);
-            const serverStatus = document.getElementById('serverStatus');
-            if (serverStatus && !this.isStreaming && !this.isListening) {
-                serverStatus.textContent = 'ONLINE';
-                serverStatus.className = 'badge bg-success';
-            }
-        });
+    this.socket.on('disconnect', () => {
+      const s = document.getElementById('serverStatus');
+      if (s) { s.textContent = 'OFFLINE'; s.className = 'badge bg-secondary'; }
+    });
 
-        this.socket.on('disconnect', () => {
-            console.log('Disconnected from server');
-            const serverStatus = document.getElementById('serverStatus');
-            if (serverStatus) {
-                serverStatus.textContent = 'OFFLINE';
-                serverStatus.className = 'badge bg-secondary';
-            }
-        });
+    this.socket.on('deviceList', (devices) => this.updateDeviceList(devices));
 
-        this.socket.on('deviceList', (devices) => this.updateDeviceList(devices));
+    this.socket.on('streamStarted', (info) => {
+      this.showToast(`${info.clientName || 'Device'} started streaming`, 'success');
+      this.socket.emit('discoverDevices');
+    });
 
-        this.socket.on('streamStarted', (info) => {
-            this.showToast(`${info.clientName || 'A device'} started streaming`, 'success');
-            this.socket.emit('discoverDevices');
-        });
+    this.socket.on('streamStopped', (info) => {
+      this.showToast(`${info.clientName || 'Device'} stopped streaming`, 'info');
+      this.socket.emit('discoverDevices');
+      if (this.listeningToSource === info.clientId) this.stopListening();
+    });
 
-        this.socket.on('streamStopped', (info) => {
-            this.showToast(`${info.clientName || 'A device'} stopped streaming`, 'info');
-            this.socket.emit('discoverDevices');
-            if (this.listeningToSource === info.clientId) {
-                this.stopListening();
-            }
-        });
-
-        this.socket.on('audioStream', (streamData) => {
-            // Count received audio packets
-            this.packetCount++;
-            const pcEl = document.getElementById('packetCount');
-            if (pcEl) pcEl.textContent = this.packetCount;
-            // Play if actively listening
-            if (this.isListening && this.listeningToSource === streamData.sourceId) {
-                this.playAudioData(streamData);
-            }
-        });
-
-        this.socket.on('joinedAsListener', (info) => {
-            this.isListening = true;
-            this.listeningToSource = info.sourceId;
-            this.updateListeningUI(info.sourceName || 'Unknown');
-        });
-
-        this.socket.on('rateLimitWarning', () => {
-            this.showToast('Server adjusted streaming rate for you', 'warning');
-        });
-
-        // Update listener count UI for the current streamer
-        this.socket.on('listenerCounts', (counts) => {
-            if (this.isStreaming) {
-                const count = counts[this.socket.id] || 0;
-                const countEl = document.getElementById('connectedCount');
-                if (countEl) countEl.textContent = count;
-            }
-        });
-    }
-
-    setupEventListeners() {
-        const startBtn = document.getElementById('startStreamBtn');
-        const stopBtn = document.getElementById('stopStreamBtn');
-        const refreshBtn = document.getElementById('refreshDevices');
-        const manualConnectBtn = document.getElementById('manualConnect');
-        const deviceSearch = document.getElementById('deviceSearch');
-
-        if (startBtn) startBtn.addEventListener('click', () => this.startStreaming());
-        if (stopBtn) stopBtn.addEventListener('click', () => this.stopStreaming());
-        if (refreshBtn) refreshBtn.addEventListener('click', () => this.discoverDevices());
-        if (manualConnectBtn) manualConnectBtn.addEventListener('click', () => this.manualConnect());
-        if (deviceSearch) deviceSearch.addEventListener('input', (e) => this.filterDevices(e.target.value));
-    }
-
-    async detectLocalIP() {
-        // best-effort local IP detection using RTC
-        try {
-            const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-            pc.createDataChannel('');
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
-            const localIP = await new Promise((resolve, reject) => {
-                pc.onicecandidate = (e) => {
-                    if (!e.candidate) return;
-                    const cand = e.candidate.candidate;
-                    const m = cand.match(/(\d+\.\d+\.\d+\.\d+)/);
-                    if (m) {
-                        resolve(m[1]);
-                        pc.close();
-                    }
-                };
-                setTimeout(() => reject(new Error('timeout')), 2000);
-            });
-
-            const el = document.getElementById('localIP');
-            if (el) el.textContent = `${localIP}:3001`;
-        } catch (err) {
-            const el = document.getElementById('localIP');
-            if (el) el.textContent = 'localhost:3001';
+    // audioStream: { sourceId, sampleRate, channels, timestamp, data: ArrayBuffer/TypedArray }
+    this.socket.on('audioStream', (streamData) => {
+      try {
+        this.packetCount++;
+        const pc = document.getElementById('packetCount');
+        if (pc) pc.textContent = this.packetCount;
+        if (this.isListening && this.listeningToSource === streamData.sourceId) {
+          this.playAudioData(streamData);
         }
-    }
+      } catch (e) {
+        console.warn('audioStream handler', e);
+      }
+    });
 
-    async startStreaming() {
-        try {
-            const startBtn = document.getElementById('startStreamBtn');
-            const stopBtn = document.getElementById('stopStreamBtn');
-            const liveIndicator = document.getElementById('liveIndicator');
-            const serverStatus = document.getElementById('serverStatus');
+    this.socket.on('joinedAsListener', (info) => {
+      this.isListening = true;
+      this.listeningToSource = info.sourceId;
+      this.updateListeningUI(info.sourceName || 'Unknown');
+    });
 
-            if (startBtn) {
-                startBtn.disabled = true;
-                startBtn.innerHTML = 'Starting...';
-            }
+    // keep rateLimit handling but unobtrusive
+    this.socket.on('rateLimitWarning', () => {
+      this.showToast('Server requested rate reduction', 'warning');
+    });
+  }
 
-            const audioSource = (document.querySelector('input[name="audioSource"]:checked') || {}).value || 'microphone';
-            const quality = (document.querySelector('input[name="quality"]:checked') || {}).value || 'high';
+  setupEventListeners() {
+    document.getElementById('startStreamBtn')?.addEventListener('click', () => this.startStreaming());
+    document.getElementById('stopStreamBtn')?.addEventListener('click', () => this.stopStreaming());
+    document.getElementById('refreshDevices')?.addEventListener('click', () => this.discoverDevices());
+    document.getElementById('manualConnect')?.addEventListener('click', () => this.manualConnect());
+    document.getElementById('deviceSearch')?.addEventListener('input', (e) => this.filterDevices(e.target.value));
+  }
 
-            this.mediaStream = await this.getMediaStream(audioSource, quality);
-            await this.setupAudioProcessing();
-
-            const deviceName = await this.getDeviceName();
-
-            this.socket.emit('startStreaming', {
-                source: audioSource,
-                quality,
-                deviceName
-            });
-
-            this.isStreaming = true;
-            if (startBtn) startBtn.classList.add('d-none');
-            if (stopBtn) stopBtn.classList.remove('d-none');
-            if (liveIndicator) liveIndicator.classList.remove('d-none');
-            if (serverStatus) {
-                serverStatus.textContent = 'LIVE';
-                serverStatus.className = 'badge bg-success';
-            }
-
-            this.showToast('Streaming started', 'success');
-        } catch (err) {
-            console.error('startStreaming error', err);
-            this.showToast('Failed to start streaming: ' + (err.message || err), 'error');
-            const startBtn = document.getElementById('startStreamBtn');
-            if (startBtn) {
-                startBtn.disabled = false;
-                startBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Start Streaming';
-            }
-        }
-    }
-
-    async stopStreaming() {
-        try {
-            // stop local capture
-            if (this.mediaStream) {
-                this.mediaStream.getTracks().forEach(t => t.stop());
-                this.mediaStream = null;
-            }
-
-            // disconnect audio nodes
-            if (this.sourceNode) { try { this.sourceNode.disconnect(); } catch (e) { } this.sourceNode = null; }
-            if (this.workletNode) { try { this.workletNode.disconnect(); } catch (e) { } this.workletNode = null; }
-            if (this.processorNode) { try { this.processorNode.disconnect(); } catch (e) { } this.processorNode = null; }
-            if (this.silentGainNode) { try { this.silentGainNode.disconnect(); } catch (e) { } this.silentGainNode = null; }
-
-            if (this.audioContext && this.audioContext.state !== 'closed') {
-                await this.audioContext.close();
-            }
-            this.audioContext = null;
-            this.isStreaming = false;
-
-            this.socket.emit('stopStreaming');
-
-            const startBtn = document.getElementById('startStreamBtn');
-            const stopBtn = document.getElementById('stopStreamBtn');
-            const liveIndicator = document.getElementById('liveIndicator');
-            const serverStatus = document.getElementById('serverStatus');
-
-            if (stopBtn) stopBtn.classList.add('d-none');
-            if (startBtn) startBtn.classList.remove('d-none');
-            if (liveIndicator) liveIndicator.classList.add('d-none');
-            if (startBtn) {
-                startBtn.disabled = false;
-                startBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Start Streaming';
-            }
-
-            if (!this.isListening && serverStatus) {
-                serverStatus.textContent = 'OFFLINE';
-                serverStatus.className = 'badge bg-secondary';
-            } else if (serverStatus) {
-                serverStatus.textContent = 'LISTENING';
-                serverStatus.className = 'badge bg-info';
-            }
-
-            this.showToast('Stopped streaming', 'info');
-        } catch (err) {
-            console.error('stopStreaming error', err);
-            this.showToast('Error stopping stream', 'error');
-        }
-    }
-
-    async getMediaStream(source, quality) {
-        const qualitySettings = {
-            low: { sampleRate: 22050, channelCount: 1 },
-            medium: { sampleRate: 44100, channelCount: 1 },
-            high: { sampleRate: 44100, channelCount: 2 },
-            ultra: { sampleRate: 48000, channelCount: 2 }
+  async detectLocalIP() {
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      pc.createDataChannel('');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const localIP = await new Promise((resolve, reject) => {
+        pc.onicecandidate = (ev) => {
+          if (!ev.candidate) return;
+          const c = ev.candidate.candidate;
+          const m = c.match(/(\d+\.\d+\.\d+\.\d+)/);
+          if (m) { resolve(m[1]); pc.close(); }
         };
-        const settings = qualitySettings[quality] || qualitySettings.high;
-
-        if (source === 'microphone') {
-            return await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    sampleRate: settings.sampleRate,
-                    channelCount: settings.channelCount,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                }
-            });
-        }
-
-        if (source === 'system') {
-            try {
-                // Some browsers require you to share the screen to get system audio
-                const stream = await navigator.mediaDevices.getDisplayMedia({
-                    audio: true,
-                    video: true   // <- must request video as well on Chrome
-                });
-
-                if (!stream.getAudioTracks().length) {
-                    stream.getTracks().forEach(t => t.stop());
-                    throw new Error('System audio not available. Please include audio when selecting screen.');
-                }
-
-                // Stop the video track immediately — we only want audio
-                stream.getVideoTracks().forEach(track => track.stop());
-                return stream;
-            } catch (err) {
-                console.error('System audio capture failed:', err);
-                throw new Error('System audio capture is not supported on this browser/device.');
-            }
-        }
-
-        throw new Error('Unknown audio source: ' + source);
+        setTimeout(() => reject(new Error('timeout')), 1700);
+      });
+      const el = document.getElementById('localIP');
+      if (el) el.textContent = `${localIP}:3001`;
+    } catch {
+      const el = document.getElementById('localIP');
+      if (el) el.textContent = 'localhost:3001';
     }
+  }
 
-    async setupAudioProcessing() {
-        if (!this.mediaStream) return;
-        // cleanup old
-        if (this.audioContext && this.audioContext.state !== 'closed') {
-            try { await this.audioContext.close(); } catch (e) { }
-            this.audioContext = null;
+  discoverDevices() { if (this.socket) this.socket.emit('discoverDevices'); }
+
+  // ---------------- SENDER ----------------
+  async getMediaStream(source, quality) {
+    const q = {
+      low: { sampleRate: 22050, channelCount: 1 },
+      medium: { sampleRate: 44100, channelCount: 1 },
+      high: { sampleRate: 44100, channelCount: 2 },
+      ultra: { sampleRate: 48000, channelCount: 2 }
+    };
+    const settings = q[quality] || q.high;
+    if (source === 'microphone') {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: settings.sampleRate,
+          channelCount: settings.channelCount,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false // disable AGC for best fidelity
         }
+      });
+    }
+    if (source === 'system') {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+      stream.getVideoTracks().forEach(t => t.stop());
+      if (!stream.getAudioTracks().length) { stream.getTracks().forEach(t => t.stop()); throw new Error('System audio unavailable'); }
+      return stream;
+    }
+    throw new Error('Unknown source');
+  }
 
-    // Prefer a fixed 48kHz rate to reduce resampling mismatch across devices
-    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  async startStreaming() {
+    try {
+      const startBtn = document.getElementById('startStreamBtn');
+      const stopBtn = document.getElementById('stopStreamBtn');
+      const liveIndicator = document.getElementById('liveIndicator');
+      const serverStatus = document.getElementById('serverStatus');
 
-        // create source
-        this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
+      if (startBtn) { startBtn.disabled = true; startBtn.innerHTML = 'Starting...'; }
 
-        // prefer AudioWorklet if available
-        if (this.audioContext.audioWorklet) {
-            try {
-                const blobUrl = this.createAudioWorkletScript();
-                await this.audioContext.audioWorklet.addModule(blobUrl);
-                this.workletNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
-                this.workletNode.port.onmessage = (e) => {
-                    if (e.data && e.data.audioBuffer) {
-                        this.sendAudioToServer(e.data.audioBuffer, 0, this.audioContext.sampleRate, 1);
-                    }
-                };
-                this.sourceNode.connect(this.workletNode);
-                // Ensure the worklet is pulled by connecting to a muted gain -> destination
-                if (!this.silentGainNode) {
-                    this.silentGainNode = this.audioContext.createGain();
-                    this.silentGainNode.gain.value = 0.0;
-                    this.silentGainNode.connect(this.audioContext.destination);
-                }
-                this.workletNode.connect(this.silentGainNode);
-                return;
-            } catch (err) {
-                console.warn('Worklet failed, falling back to ScriptProcessor', err);
-            }
-        }
+      const source = (document.querySelector('input[name="audioSource"]:checked') || {}).value || 'microphone';
+      const quality = (document.querySelector('input[name="quality"]:checked') || {}).value || 'high';
 
-        // fallback: ScriptProcessor
-        this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
-        // Accumulate into fixed 20ms packets for consistent network pacing
-        const framesPerPacket = Math.round(this.audioContext.sampleRate * 0.02);
-        this._pendingChunks = [];
-        this._pendingLength = 0; // in frames
+      this.mediaStream = await this.getMediaStream(source, quality);
+
+      // Capture context: use default sampleRate (browser chosen) but capture sampleRate metadata will be sent
+      this.captureContext = new (window.AudioContext || window.webkitAudioContext)();
+      this.captureSourceNode = this.captureContext.createMediaStreamSource(this.mediaStream);
+
+      // muted gain to keep graph alive, avoid feedback
+      this.silentGainNode = this.captureContext.createGain();
+      this.silentGainNode.gain.value = 0;
+      this.silentGainNode.connect(this.captureContext.destination);
+
+      // prefer AudioWorklet
+      try {
+        const url = this.createCaptureWorkletScript();
+        await this.captureContext.audioWorklet.addModule(url);
+        this.workletNode = new AudioWorkletNode(this.captureContext, 'capture-processor');
+        this.workletNode.port.onmessage = (ev) => {
+          if (!this.socket) return;
+          const d = ev.data;
+          const payload = {
+            seq: ++this._sendSeq,
+            sampleRate: d.sampleRate || this.captureContext.sampleRate,
+            channels: d.channels || 1,
+            timestamp: Date.now(),
+            data: d.audioBuffer
+          };
+          this.socket.emit('audioData', payload);
+        };
+        this.captureSourceNode.connect(this.workletNode);
+        this.workletNode.connect(this.silentGainNode);
+      } catch (err) {
+        // fallback ScriptProcessor: produce interleaved Float32 packets (~20ms)
+        const buf = 2048;
+        this.processorNode = this.captureContext.createScriptProcessor(buf, this.captureSourceNode.channelCount || 1, this.captureSourceNode.channelCount || 1);
+
+        const framesPerPacket = Math.round(this.captureContext.sampleRate * 0.02);
+        const pending = [];
+        let pendingFrames = 0;
+
         this.processorNode.onaudioprocess = (e) => {
-            if (!this.isStreaming) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const copy = new Float32Array(input.length);
-            copy.set(input);
-            this._pendingChunks.push(copy);
-            this._pendingLength += copy.length;
-
-            while (this._pendingLength >= framesPerPacket) {
-                const out = new Float32Array(framesPerPacket);
-                let offset = 0;
-                while (offset < framesPerPacket && this._pendingChunks.length) {
-                    const head = this._pendingChunks[0];
-                    const need = framesPerPacket - offset;
-                    if (head.length <= need) {
-                        out.set(head, offset);
-                        offset += head.length;
-                        this._pendingChunks.shift();
-                    } else {
-                        out.set(head.subarray(0, need), offset);
-                        this._pendingChunks[0] = head.subarray(need);
-                        offset += need;
-                    }
-                }
-                this._pendingLength -= framesPerPacket;
-                this.sendAudioToServer(out.buffer, 0, this.audioContext.sampleRate, 1);
+          if (!this.isStreaming) return;
+          const chCount = e.inputBuffer.numberOfChannels;
+          const frameLen = e.inputBuffer.length;
+          // interleave channels
+          const inter = new Float32Array(frameLen * chCount);
+          for (let c = 0; c < chCount; c++) {
+            const ch = e.inputBuffer.getChannelData(c);
+            for (let i = 0; i < frameLen; i++) inter[i * chCount + c] = ch[i];
+          }
+          pending.push(inter);
+          pendingFrames += frameLen;
+          while (pendingFrames >= framesPerPacket) {
+            const out = new Float32Array(framesPerPacket * chCount);
+            let filled = 0;
+            while (filled < framesPerPacket && pending.length) {
+              const head = pending[0];
+              const headFrames = head.length / chCount;
+              const need = framesPerPacket - filled;
+              if (headFrames <= need) {
+                out.set(head, filled * chCount);
+                filled += headFrames;
+                pending.shift();
+              } else {
+                out.set(head.subarray(0, need * chCount), filled * chCount);
+                pending[0] = head.subarray(need * chCount);
+                filled += need;
+              }
             }
+            pendingFrames -= framesPerPacket;
+            if (this.socket) {
+              const payload = {
+                seq: ++this._sendSeq,
+                sampleRate: this.captureContext.sampleRate,
+                channels: chCount,
+                timestamp: Date.now(),
+                data: out.buffer
+              };
+              this.socket.emit('audioData', payload);
+            }
+          }
         };
-        this.sourceNode.connect(this.processorNode);
-        // Ensure the processor is pulled by connecting to a muted gain -> destination
-        if (!this.silentGainNode) {
-            this.silentGainNode = this.audioContext.createGain();
-            this.silentGainNode.gain.value = 0.0;
-            this.silentGainNode.connect(this.audioContext.destination);
-        }
-        this.processorNode.connect(this.silentGainNode);
-    }
 
-    // Worklet code served as blob URL
-        createAudioWorkletScript() {
-        const workletScript = `
-      class AudioProcessor extends AudioWorkletProcessor {
+        this.captureSourceNode.connect(this.processorNode);
+        this.processorNode.connect(this.silentGainNode);
+      }
+
+      const name = await this.getDeviceName();
+      this.socket.emit('startStreaming', { source, quality, deviceName: name });
+
+      this.isStreaming = true;
+      if (startBtn) startBtn.classList.add('d-none');
+      if (stopBtn) stopBtn.classList.remove('d-none');
+      if (liveIndicator) liveIndicator.classList.remove('d-none');
+      if (serverStatus) { serverStatus.textContent = 'LIVE'; serverStatus.className = 'badge bg-success'; }
+
+      this.showToast('Streaming started', 'success');
+    } catch (e) {
+      console.error('startStreaming error', e);
+      this.showToast('Failed to start streaming: ' + (e.message || e), 'error');
+      const startBtn = document.getElementById('startStreamBtn');
+      if (startBtn) { startBtn.disabled = false; startBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Start Streaming'; }
+    }
+  }
+
+  async stopStreaming() {
+    try {
+      if (this.mediaStream) { this.mediaStream.getTracks().forEach(t => t.stop()); this.mediaStream = null; }
+      if (this.captureSourceNode) { try { this.captureSourceNode.disconnect(); } catch (_) {} this.captureSourceNode = null; }
+      if (this.workletNode) { try { this.workletNode.disconnect(); } catch (_) {} this.workletNode = null; }
+      if (this.processorNode) { try { this.processorNode.disconnect(); } catch (_) {} this.processorNode = null; }
+      if (this.silentGainNode) { try { this.silentGainNode.disconnect(); } catch (_) {} this.silentGainNode = null; }
+      if (this.captureContext && this.captureContext.state !== 'closed') { try { await this.captureContext.close(); } catch (_) {} }
+      this.captureContext = null;
+
+      if (this.socket) this.socket.emit('stopStreaming');
+      this.isStreaming = false;
+
+      const startBtn = document.getElementById('startStreamBtn');
+      const stopBtn = document.getElementById('stopStreamBtn');
+      const liveIndicator = document.getElementById('liveIndicator');
+      const serverStatus = document.getElementById('serverStatus');
+
+      if (stopBtn) stopBtn.classList.add('d-none');
+      if (startBtn) startBtn.classList.remove('d-none');
+      if (liveIndicator) liveIndicator.classList.add('d-none');
+      if (startBtn) { startBtn.disabled = false; startBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Start Streaming'; }
+
+      if (!this.isListening && serverStatus) { serverStatus.textContent = 'OFFLINE'; serverStatus.className = 'badge bg-secondary'; }
+      else if (serverStatus) { serverStatus.textContent = 'LISTENING'; serverStatus.className = 'badge bg-info'; }
+
+      this.showToast('Stopped streaming', 'info');
+    } catch (e) {
+      console.error('stopStreaming error', e);
+      this.showToast('Error stopping stream', 'error');
+    }
+  }
+
+  createCaptureWorkletScript() {
+    const code = `
+      class CaptureProcessor extends AudioWorkletProcessor {
         constructor() {
           super();
-                    // Accumulate to ~20ms frames based on sampleRate to avoid jitter
-                    this.framesPerPacket = Math.round(sampleRate * 0.02);
-                    this.pending = [];
-                    this.pendingLength = 0; // in frames
+          this.framesPerPacket = Math.max(1, Math.round(sampleRate * 0.02));
+          this.pending = [];
+          this.pendingFrames = 0;
         }
         process(inputs) {
           const input = inputs[0];
           if (!input || !input[0]) return true;
-                    const channelData = input[0]; // mono
-                    const copy = new Float32Array(channelData.length);
-                    copy.set(channelData);
-                    this.pending.push(copy);
-                    this.pendingLength += copy.length;
-                    while (this.pendingLength >= this.framesPerPacket) {
-                        const out = new Float32Array(this.framesPerPacket);
-                        let offset = 0;
-                        while (offset < this.framesPerPacket && this.pending.length) {
-                            const head = this.pending[0];
-                            const need = this.framesPerPacket - offset;
-                            if (head.length <= need) {
-                                out.set(head, offset);
-                                offset += head.length;
-                                this.pending.shift();
-                            } else {
-                                out.set(head.subarray(0, need), offset);
-                                this.pending[0] = head.subarray(need);
-                                offset += need;
-                            }
-                        }
-                        this.pendingLength -= this.framesPerPacket;
-                        this.port.postMessage({ audioBuffer: out.buffer }, [out.buffer]);
-                    }
+          const channels = input.length;
+          const frameLen = input[0].length;
+          const inter = new Float32Array(frameLen * channels);
+          for (let c = 0; c < channels; c++) {
+            const data = input[c];
+            for (let i = 0; i < frameLen; i++) inter[i * channels + c] = data[i];
+          }
+          this.pending.push(inter);
+          this.pendingFrames += frameLen;
+          while (this.pendingFrames >= this.framesPerPacket) {
+            const out = new Float32Array(this.framesPerPacket * channels);
+            let filled = 0;
+            while (filled < this.framesPerPacket && this.pending.length) {
+              const head = this.pending[0];
+              const headFrames = head.length / channels;
+              const need = this.framesPerPacket - filled;
+              if (headFrames <= need) {
+                out.set(head, filled * channels);
+                filled += headFrames;
+                this.pending.shift();
+              } else {
+                out.set(head.subarray(0, need * channels), filled * channels);
+                this.pending[0] = head.subarray(need * channels);
+                filled += need;
+              }
+            }
+            this.pendingFrames -= this.framesPerPacket;
+            this.port.postMessage({ audioBuffer: out.buffer, frameSamples: this.framesPerPacket, sampleRate, channels }, [out.buffer]);
+          }
           return true;
         }
       }
-      registerProcessor('audio-processor', AudioProcessor);
+      registerProcessor('capture-processor', CaptureProcessor);
     `;
-        const blob = new Blob([workletScript], { type: 'application/javascript' });
-        return URL.createObjectURL(blob);
-    }
+    return URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+  }
 
-    sendAudioToServer(arrayBuffer, channel = 0, sampleRate = 48000, channels = 1) {
-        this.socket.emit('audioData', {
-            channel,
-            channels,
-            sampleRate,
-            timestamp: Date.now(),
-            data: arrayBuffer
-        });
-    }
+  // ---------------- LISTENER / PLAYBACK ----------------
+  async startListening(sourceId) {
+    if (!this.audioContext) this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.audioContext.state === 'suspended') await this.audioContext.resume();
 
-    // ----- Listening / Playback -----
-    async startListening(sourceId) {
-        // Ensure AudioContext exists and is resumed
-        if (!this.audioContext) {
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-        }
-        if (this.audioContext.state === 'suspended') {
-            await this.audioContext.resume();
-        }
+    // unlock audio with a tiny silent tick (cheap)
+    try {
+      const g = this.audioContext.createGain(); g.gain.value = 0.0001;
+      const osc = this.audioContext.createOscillator();
+      osc.connect(g).connect(this.audioContext.destination);
+      osc.start(); osc.stop(this.audioContext.currentTime + 0.01);
+    } catch (_) {}
 
-        // 🔊 PLAY TEST BEEP — to confirm audio playback works on phone
-        try {
-            const osc = this.audioContext.createOscillator();
-            const gain = this.audioContext.createGain();
-            gain.gain.value = 0.3; // not too loud
-            osc.connect(gain).connect(this.audioContext.destination);
-            osc.start();
-            osc.stop(this.audioContext.currentTime + 0.4);
-            console.log('✅ Test beep played on listener');
-        } catch (err) {
-            console.warn('Beep test failed:', err);
-        }
-
-        // Setup playback pipeline
-        this.setupAudioPlayback();
-        this.listeningToSource = sourceId;
-
-    // Reset packet count
+    this.setupAudioPlayback();
+    this.listeningToSource = sourceId;
+    this.isListening = true;
     this.packetCount = 0;
-    // Tell server we want to listen to this source
-    this.socket.emit('joinAsListener', sourceId);
+
+    if (this.socket) this.socket.emit('joinAsListener', sourceId);
     this.showToast('Joining as listener...', 'info');
+
+    // mark button without full device list refresh
+    this.markDeviceButtonListening(sourceId, true);
+  }
+
+  stopListening() {
+    if (!this.isListening && !this.listeningToSource) return;
+    const prev = this.listeningToSource;
+    this.isListening = false;
+    this.listeningToSource = null;
+    if (this.socket) this.socket.emit('leaveAsListener');
+
+    this.audioQueue = [];
+    this.isProcessingQueue = false;
+    this.nextPlayTime = 0;
+    for (const s of Array.from(this.activeSources)) { try { s.stop(0); s.disconnect(); } catch (_) {} }
+    this.activeSources.clear();
+
+    if (prev) this.markDeviceButtonListening(prev, false);
+
+    const serverStatus = document.getElementById('serverStatus');
+    if (serverStatus) { serverStatus.textContent = this.isStreaming ? 'LIVE' : 'ONLINE'; serverStatus.className = this.isStreaming ? 'badge bg-success' : 'badge bg-secondary'; }
+    this.showToast('Stopped listening', 'info');
+  }
+
+  setupAudioPlayback() {
+    if (!this.audioContext) return;
+    if (!this.playbackGain) {
+      this.playbackGain = this.audioContext.createGain();
+      this.playbackGain.gain.value = 1.0;
+      this.playbackGain.connect(this.audioContext.destination);
+    }
+    if (!this.nextPlayTime) this.nextPlayTime = this.audioContext.currentTime + this.fixedLatency;
+  }
+
+  // Play audioData: resample if needed and preserve channels (stereo -> stereo; dual-mono -> dual-mono; mono -> mono)
+  async playAudioData(streamData) {
+    if (!this.audioContext) return;
+    if (!streamData || !streamData.data) return;
+
+    // normalize incoming buffer to ArrayBuffer
+    let srcBuffer;
+    if (streamData.data instanceof ArrayBuffer) srcBuffer = streamData.data;
+    else if (ArrayBuffer.isView(streamData.data)) srcBuffer = streamData.data.buffer.slice(streamData.data.byteOffset, streamData.data.byteOffset + streamData.data.byteLength);
+    else if (Array.isArray(streamData.data)) { const t = new Float32Array(streamData.data.length); t.set(streamData.data); srcBuffer = t.buffer; }
+    else { console.warn('unsupported audio payload'); return; }
+
+    const srcRate = streamData.sampleRate || 48000;
+    const channels = streamData.channels || 1;
+
+    // interpret as Float32Array interleaved
+    let interleaved = new Float32Array(srcBuffer);
+
+    // If incoming channels >1 keep channels as-is. We'll resample preserving channels.
+    // Resample using OfflineAudioContext for best quality if sampleRate mismatch.
+    const targetRate = this.audioContext.sampleRate;
+    let processedInterleaved = interleaved;
+    let processedChannels = channels;
+
+    if (srcRate !== targetRate) {
+      try {
+        processedInterleaved = await this.resampleInterleaved(interleaved, srcRate, targetRate, channels);
+      } catch (e) {
+        console.warn('resample error, using raw buffer', e);
+      }
     }
 
-    stopListening() {
-        if (!this.isListening && !this.listeningToSource) {
-            // nothing to stop
-        }
-        this.isListening = false;
-        this.listeningToSource = null;
-        this.socket.emit('leaveAsListener');
-        this.audioQueue = [];
-        this.nextPlayTime = 0;
-        this.isProcessingQueue = false;
+    // push to queue (preserve channels exactly as coming)
+    this.audioQueue.push({ data: processedInterleaved, channels: processedChannels, sampleRate: targetRate, timestamp: streamData.timestamp || Date.now() });
 
-        const listenStatus = document.getElementById('listenStatus');
-        if (listenStatus) listenStatus.remove();
+    if (!this.isProcessingQueue) this.processAudioQueue();
+  }
 
-        const serverStatus = document.getElementById('serverStatus');
-        if (serverStatus) {
-            serverStatus.textContent = this.isStreaming ? 'LIVE' : 'ONLINE';
-            serverStatus.className = this.isStreaming ? 'badge bg-success' : 'badge bg-success';
-        }
+  async resampleInterleaved(interleaved, srcRate, dstRate, channels) {
+    if (srcRate === dstRate) return interleaved.slice(0);
+    const srcFrames = Math.floor(interleaved.length / channels);
+    const dstFrames = Math.ceil(srcFrames * dstRate / srcRate);
 
-        this.showToast('Stopped listening', 'info');
+    // create offline at srcRate to hold source buffer
+    const srcOffline = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(channels, srcFrames, srcRate);
+    const srcBuf = srcOffline.createBuffer(channels, srcFrames, srcRate);
+    for (let ch = 0; ch < channels; ch++) {
+      const chData = srcBuf.getChannelData(ch);
+      for (let i = 0, k = ch; i < srcFrames; i++, k += channels) chData[i] = interleaved[k];
     }
 
-    setupAudioPlayback() {
-        if (!this.audioContext) return;
-        if (!this.playbackGainNode) {
-            this.playbackGainNode = this.audioContext.createGain();
-            this.playbackGainNode.connect(this.audioContext.destination);
-            this.playbackGainNode.gain.value = 1.0;
+    // render into offline at dstRate
+    const offline = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(channels, dstFrames, dstRate);
+    const srcNode = offline.createBufferSource();
+    srcNode.buffer = srcBuf;
+    srcNode.connect(offline.destination);
+    srcNode.start(0);
+    const rendered = await offline.startRendering();
+
+    const outFrames = rendered.length;
+    const out = new Float32Array(outFrames * channels);
+    for (let ch = 0; ch < channels; ch++) {
+      const chData = rendered.getChannelData(ch);
+      for (let i = 0; i < outFrames; i++) out[i * channels + ch] = chData[i];
+    }
+    return out;
+  }
+
+  async processAudioQueue() {
+    if (this.isProcessingQueue) return;
+    if (!this.audioContext) return;
+    this.isProcessingQueue = true;
+
+    while (this.audioQueue.length) {
+      const item = this.audioQueue.shift();
+      try {
+        const ch = item.channels || 1;
+        const frames = Math.floor(item.data.length / ch);
+
+        const audioBuffer = this.audioContext.createBuffer(ch, frames, item.sampleRate || this.audioContext.sampleRate);
+        for (let c = 0; c < ch; c++) {
+          const chData = audioBuffer.getChannelData(c);
+          for (let i = 0, k = c; i < frames; i++, k += ch) chData[i] = item.data[k];
         }
+
+        const src = this.audioContext.createBufferSource();
+        src.buffer = audioBuffer;
+
+        src.connect(this.playbackGain);
+
+        const now = this.audioContext.currentTime;
+        if (!this.nextPlayTime || this.nextPlayTime < now) this.nextPlayTime = now + this.fixedLatency;
+
+        const startAt = this.nextPlayTime;
+        try { src.start(startAt); } catch (e) { try { src.start(); } catch (_) {} }
+        this.nextPlayTime = startAt + audioBuffer.duration;
+
+        src.onended = () => { try { this.activeSources.delete(src); } catch (_) {} };
+
+        this.activeSources.add(src);
+
+        // allow event loop to breathe (no visible jitter)
+        await new Promise(r => setTimeout(r, 0));
+      } catch (e) {
+        console.warn('processAudioQueue error', e);
+      }
     }
 
-    playAudioData(streamData) {
-        if (!this.audioContext) return;
-        if (!streamData || !streamData.data) return;
+    this.isProcessingQueue = false;
+  }
 
-        // streamData.data may be ArrayBuffer or Array
-        let floatArr;
-        if (streamData.data instanceof ArrayBuffer) {
-            floatArr = new Float32Array(streamData.data);
-        } else if (Array.isArray(streamData.data)) {
-            floatArr = new Float32Array(streamData.data);
-        } else {
-            console.warn('Unsupported audio format from server');
-            this.showToast('Unsupported audio format from server', 'error');
-            return;
-        }
+  // ---------------- DEVICE UI (compact rows) ----------------
+  updateDeviceList(devices) {
+    const listEl = document.getElementById('deviceList');
+    const countEl = document.getElementById('onlineDeviceCount');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    let online = 0;
+    devices.forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'd-flex align-items-center justify-content-between py-2 border-bottom';
+      const left = document.createElement('div');
+      left.innerHTML = `<div class="fw-semibold">${d.name || d.id}</div><div class="text-muted small">${d.ip || ''}</div>`;
+      const right = document.createElement('div');
 
-        this.audioQueue.push({
-            data: floatArr,
-            timestamp: streamData.timestamp || Date.now()
+      if (d.isStreaming) {
+        online++;
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-sm btn-outline-primary';
+        btn.innerHTML = '<i class="bi bi-headphones me-1"></i>Listen';
+        btn.dataset.id = d.id;
+        btn.addEventListener('click', () => {
+          if (this.isListening && this.listeningToSource === d.id) {
+            this.stopListening();
+            btn.innerHTML = '<i class="bi bi-headphones me-1"></i>Listen';
+          } else {
+            this.startListening(d.id);
+            btn.innerHTML = 'Stop';
+          }
         });
+        right.appendChild(btn);
+      } else {
+        const disabled = document.createElement('button');
+        disabled.className = 'btn btn-sm btn-secondary';
+        disabled.disabled = true;
+        disabled.textContent = 'Not streaming';
+        right.appendChild(disabled);
+      }
 
-        if (!this.isProcessingQueue) this.processAudioQueue();
+      row.appendChild(left);
+      row.appendChild(right);
+      listEl.appendChild(row);
+    });
+    if (countEl) countEl.textContent = `${online} online`;
+  }
+
+  markDeviceButtonListening(deviceId, listening) {
+    const listEl = document.getElementById('deviceList');
+    if (!listEl) return;
+    listEl.querySelectorAll('button').forEach(b => {
+      if (b.dataset.id === deviceId) b.textContent = listening ? 'Stop' : 'Listen';
+    });
+  }
+
+  connectToDevice(deviceId) { this.startListening(deviceId); }
+
+  updateListeningUI(sourceName) {
+    let listenStatus = document.getElementById('listenStatus');
+    if (!listenStatus) {
+      const playCard = document.querySelector('#play .card-body') || document.body;
+      const html = `
+        <div class="alert alert-info mb-3" id="listenStatus">
+          LISTENING TO: <strong id="listenSourceName">${sourceName}</strong>
+          <button class="btn btn-sm btn-outline-info float-end" id="stopListenBtn">Stop</button>
+          <div class="mt-2">Packets received: <span id="packetCount">0</span></div>
+        </div>`;
+      playCard.insertAdjacentHTML('afterbegin', html);
+      document.getElementById('stopListenBtn').addEventListener('click', () => this.stopListening());
+    } else {
+      const nameEl = document.getElementById('listenSourceName');
+      if (nameEl) nameEl.textContent = sourceName;
+      listenStatus.classList.remove('d-none');
     }
+    const serverStatus = document.getElementById('serverStatus');
+    if (serverStatus) { serverStatus.textContent = 'LISTENING'; serverStatus.className = 'badge bg-info'; }
+  }
 
-    async processAudioQueue() {
-        if (this.isProcessingQueue) return;
-        this.isProcessingQueue = true;
+  manualConnect() {
+    const manualIP = document.getElementById('manualIP')?.value?.trim();
+    if (!manualIP) { this.showToast('Enter IP:PORT', 'warning'); return; }
+    const [ip, port] = manualIP.split(':');
+    this.socket.emit('manualConnect', { ip, port: port ? parseInt(port) : 3001 });
+  }
 
-        while (this.audioQueue.length) {
-            const item = this.audioQueue.shift();
-            try {
-                const buffer = this.audioContext.createBuffer(1, item.data.length, this.audioContext.sampleRate);
-                buffer.getChannelData(0).set(item.data);
+  filterDevices(q) {
+    const query = (q || '').trim().toLowerCase();
+    document.querySelectorAll('#deviceList > div').forEach(card => {
+      const txt = card.textContent.toLowerCase();
+      card.style.display = txt.includes(query) ? '' : 'none';
+    });
+  }
 
-                const src = this.audioContext.createBufferSource();
-                src.buffer = buffer;
-                src.connect(this.playbackGainNode);
+  async getDeviceName() {
+    try {
+      const ua = navigator.userAgent || '';
+      if (ua.includes('Windows')) return 'Windows PC';
+      if (ua.includes('Mac')) return 'Mac';
+      if (ua.includes('Linux')) return 'Linux';
+      if (/Android/.test(ua)) return 'Android';
+      if (/iPhone|iPad/.test(ua)) return 'iOS';
+    } catch {}
+    return 'Unknown Device';
+  }
 
-                const now = this.audioContext.currentTime;
-                // If we're too close to now and queue is shallow, bump forward to rebuild cushion
-                if (this.nextPlayTime <= now || (this.nextPlayTime - now) < 0.05) {
-                    this.nextPlayTime = now + this.audioLatency;
-                }
-                src.start(this.nextPlayTime);
-                this.nextPlayTime += buffer.duration;
-
-                // allow tiny delay for scheduling
-                await new Promise(resolve => setTimeout(resolve, 5));
-            } catch (err) {
-                this.showToast('Audio playback error: ' + (err.message || err), 'error');
-            }
-        }
-
-        this.isProcessingQueue = false;
+  showToast(message, type = 'info') {
+    const container = document.getElementById('toastContainer');
+    if (!container) { console.log(`${type.toUpperCase()}:`, message); return; }
+    const id = 't' + Date.now();
+    const bg = type === 'error' ? 'bg-danger' : type === 'success' ? 'bg-success' : type === 'warning' ? 'bg-warning' : 'bg-info';
+    const html = `<div id="${id}" class="toast ${bg} text-white align-items-center" role="alert" aria-live="assertive" aria-atomic="true" style="min-width:200px; margin-bottom:6px;"><div class="d-flex"><div class="toast-body">${message}</div><button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div></div>`;
+    container.insertAdjacentHTML('beforeend', html);
+    const el = document.getElementById(id);
+    try {
+      const bsToast = new bootstrap.Toast(el, { delay: 4000 });
+      bsToast.show();
+      el.addEventListener('hidden.bs.toast', () => el.remove());
+    } catch {
+      setTimeout(() => el.remove(), 4000);
     }
-
-    // ----- UI / helpers -----
-    updateDeviceList(devices) {
-        const deviceList = document.getElementById('deviceList');
-        if (!deviceList) return;
-
-        if (!devices || devices.length === 0) {
-            deviceList.innerHTML = '<div class="text-muted p-3">No devices found</div>';
-            return;
-        }
-
-        deviceList.innerHTML = devices.map(d => {
-            const live = d.isStreaming ? '<span class="badge bg-success me-1">LIVE</span>' : '';
-            const listenBtn = d.isStreaming ? `<button class="btn btn-sm btn-success" onclick="app.connectToDevice('${d.id}')"><i class="bi bi-headphones me-1"></i>Listen</button>` : `<button class="btn btn-sm btn-secondary" disabled>Not streaming</button>`;
-            return `
-        <div class="card mb-2 p-2">
-          <div class="d-flex justify-content-between align-items-center">
-            <div>
-              <strong>${d.name}</strong> ${live} <br>
-              <small class="font-monospace">${d.ip}:${d.port}</small>
-            </div>
-            <div>${listenBtn}</div>
-          </div>
-        </div>
-      `;
-        }).join('');
-    }
-
-    connectToDevice(deviceId) {
-        // send a connect request; the server will respond with joinedAsListener and audioStream events
-        this.startListening(deviceId);
-    }
-
-    updateListeningUI(sourceName) {
-                let listenStatus = document.getElementById('listenStatus');
-                if (!listenStatus) {
-                        const playCardBody = document.querySelector('#play .card-body') || document.body;
-                        const html = `
-                <div class="alert alert-info mb-3" id="listenStatus">
-                    LISTENING TO: <strong id="listenSourceName">${sourceName}</strong>
-                    <button class="btn btn-sm btn-outline-info float-end" onclick="app.stopListening()">Stop</button>
-                    <div class="mt-2">Packets received: <span id="packetCount">0</span></div>
-                </div>
-            `;
-                        playCardBody.insertAdjacentHTML('afterbegin', html);
-                } else {
-                        document.getElementById('listenSourceName').textContent = sourceName;
-                        listenStatus.classList.remove('d-none');
-                }
-
-        const serverStatus = document.getElementById('serverStatus');
-        if (serverStatus) {
-            serverStatus.textContent = 'LISTENING';
-            serverStatus.className = 'badge bg-info';
-        }
-        this.isListening = true;
-    }
-
-    manualConnect() {
-        const manualIP = document.getElementById('manualIP')?.value?.trim();
-        if (!manualIP) {
-            this.showToast('Enter IP:PORT', 'warning');
-            return;
-        }
-        const [ip, port] = manualIP.split(':');
-        this.socket.emit('manualConnect', { ip, port: port ? parseInt(port) : 3001 });
-    }
-
-    filterDevices(query) {
-        const q = query.trim().toLowerCase();
-        document.querySelectorAll('#deviceList .card').forEach(card => {
-            const txt = card.textContent.toLowerCase();
-            card.style.display = txt.includes(q) ? '' : 'none';
-        });
-    }
-
-    async getDeviceName() {
-        try {
-            const ua = navigator.userAgent;
-            if (ua.includes('Windows')) return 'Windows PC';
-            if (ua.includes('Mac')) return 'Mac';
-            if (ua.includes('Linux')) return 'Linux';
-            if (/Android/.test(ua)) return 'Android';
-            if (/iPhone|iPad/.test(ua)) return 'iOS';
-        } catch (e) { }
-        return 'Unknown Device';
-    }
-
-    showToast(message, type = 'info') {
-        const toastContainer = document.getElementById('toastContainer');
-        if (!toastContainer) {
-            console.log(`${type.toUpperCase()}:`, message);
-            return;
-        }
-
-        const id = 't' + Date.now();
-        const bg = type === 'error' ? 'bg-danger' : type === 'success' ? 'bg-success' : type === 'warning' ? 'bg-warning' : 'bg-info';
-        const html = `
-      <div id="${id}" class="toast ${bg} text-white align-items-center" role="alert" aria-live="assertive" aria-atomic="true" style="min-width:200px; margin-bottom:6px;">
-        <div class="d-flex">
-          <div class="toast-body">${message}</div>
-          <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-        </div>
-      </div>`;
-        toastContainer.insertAdjacentHTML('beforeend', html);
-        const el = document.getElementById(id);
-        try {
-            const bsToast = new bootstrap.Toast(el, { delay: 4000 });
-            bsToast.show();
-            el.addEventListener('hidden.bs.toast', () => el.remove());
-        } catch (e) {
-            setTimeout(() => el.remove(), 4000);
-        }
-    }
+  }
 }
 
-// expose globally
 window.app = new AudioTransferApp();

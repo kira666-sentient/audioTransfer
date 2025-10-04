@@ -135,7 +135,7 @@ class AudioTransferServer {
                     return;
                 }
                 
-                console.log(`Client ${socket.id} started streaming:`, data);
+                console.log(`🎙️  ${socket.id} started streaming (${data.source}, ${data.quality})`);
                 
                 // Update client info
                 const client = this.connectedClients.get(socket.id);
@@ -180,13 +180,6 @@ class AudioTransferServer {
             });
 
             socket.on('audioData', (data) => {
-                // Debug: log when receiving audioData from client
-                if (!socket._audioReceiveCounter) socket._audioReceiveCounter = 0;
-                socket._audioReceiveCounter++;
-                if (socket._audioReceiveCounter % 20 === 0) {
-                    const sz = data?.data?.byteLength || data?.data?.length || 0;
-                    console.log(`🛬 [server] Received audioData from ${socket.id} | size: ${sz}`);
-                }
                 // Rate limiting for audio data
                 const clientId = socket.id;
                 const now = Date.now();
@@ -252,6 +245,9 @@ class AudioTransferServer {
                         timestamp: data.timestamp || Date.now(),
                         quality: streamInfo.streamConfig?.quality,
                         channel: data.channel || 0,
+                        seq: data.seq,
+                        sampleIndex: data.sampleIndex,
+                        frameSamples: data.frameSamples,
                         channels: data.channels || 1,
                         sampleRate: data.sampleRate || 48000,
                         data: normalizedArrayBuffer
