@@ -18,10 +18,12 @@ class AudioTransferServer {
             cors: {
                 origin: process.env.ALLOWED_ORIGINS ? 
                     process.env.ALLOWED_ORIGINS.split(',') : 
-                    ["http://localhost:3001", "http://127.0.0.1:3001"],
+                    true, // Allow all origins for local development
                 methods: ["GET", "POST"],
                 credentials: false
-            }
+            },
+            allowEIO3: true, // Support older clients
+            transports: ['websocket', 'polling'] // Ensure both transports work
         });
         
         this.connectedClients = new Map();
@@ -436,7 +438,7 @@ class AudioTransferServer {
     }
 
     start() {
-        this.server.listen(this.port, () => {
+        this.server.listen(this.port, '0.0.0.0', () => {
             const localIP = this.getLocalIP();
             console.log('🎵 Audio Transfer Server Started!');
             console.log('=====================================');

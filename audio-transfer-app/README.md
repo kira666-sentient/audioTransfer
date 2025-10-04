@@ -271,6 +271,34 @@ To access from other devices on your network:
 
 ## 🐛 Troubleshooting
 
+### Mobile Streaming Issues (Can't stream from phone)
+**HTTPS Required for Mobile**: Mobile browsers require HTTPS for microphone access on remote connections.
+
+**Quick Fix Options:**
+1. **Use ngrok (Recommended)**:
+   ```bash
+   # Install ngrok globally
+   npm install -g ngrok
+   
+   # Start your server
+   npm start
+   
+   # In another terminal, create HTTPS tunnel
+   ngrok http 3001
+   
+   # Use the https:// URL on your mobile device
+   ```
+
+2. **Local IP Exception**: Some mobile browsers allow `http://` for local IPs:
+   - Find your computer's IP: `ipconfig` (Windows) or `ifconfig` (Mac/Linux)
+   - Try `http://192.168.1.XXX:3001` on mobile
+   - If it doesn't work, use ngrok
+
+3. **Network Requirements**:
+   - Both devices must be on the same Wi-Fi network
+   - Disable mobile data to ensure Wi-Fi usage
+   - Check that firewall allows port 3001
+
 ### Audio not working
 - Check browser permissions for microphone
 - Ensure HTTPS for system audio capture
@@ -283,8 +311,9 @@ To access from other devices on your network:
 
 ### Browser compatibility
 - Chrome/Chromium: Full support
-- Firefox: Limited system audio support
+- Firefox: Limited system audio support  
 - Safari: Basic functionality
+- **Mobile Chrome/Safari**: Requires HTTPS for audio capture
 
 ## 🤝 Contributing
 
