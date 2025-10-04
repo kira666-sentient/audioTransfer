@@ -31,14 +31,17 @@ class AudioTransferApp {
     // Feature toggles for rapid A/B testing of artifact sources
     this.features = {
       adaptiveLatency: false, // DISABLED: timing changes cause crackling
-      seqGapSilenceInsert: false, // DISABLED: silence insertion can cause pops
+      seqGapSilenceInsert: true, // allow tiny concealment
       conditionalFade: true, // ONLY keep basic fade-in
-      overlapAdd: false, // DISABLED: complex crossfade causing issues
+      overlapAdd: true, // enable guarded crossfade
       dcOffsetCorrection: false, // DISABLED: can cause artifacts
       coalescePackets: false, // DISABLED: was creating periodic beep artifacts at coalesce boundaries
       boundarySlopeCorrection: false, // DISABLED: slope correction causing artifacts
       boundaryDither: false // DISABLED: dither causing artifacts
     };
+    // Minimal smoothing configuration
+    this.minCrossfadeMs = 0.8; // very short safe crossfade window
+    this.maxCrossfadeMs = 2.5; // cap to avoid mushiness
     this.crossfadeMs = 0.002; // 2ms overlap-add window
     this.coalesce = { data: [], samples: 0, channels: null, sampleRate: null, lastTs: 0, maxMs: 40 };
     this.baseLatency = this.fixedLatency; // remember mode baseline for adaptive adjustments
@@ -571,6 +574,9 @@ class AudioTransferApp {
         osc.start(); osc.stop(this.audioContext.currentTime + 0.01);
       } catch (_) { }
 
+      // Tell browser we're playing media - prevents disconnection on screen off
+      this.setupMediaSession(sourceId);
+
       this.setupAudioPlayback();
       this.listeningToSource = sourceId;
       this.isListening = true;
@@ -619,6 +625,17 @@ class AudioTransferApp {
     const listenStatus = document.getElementById('listenStatus');
     if (listenStatus) {
       listenStatus.remove();
+    }
+
+    // Clear media session and stop hidden audio
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'none';
+      navigator.mediaSession.metadata = null;
+    }
+    const audioEl = document.getElementById('mediaSessionAudio');
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.src = '';
     }
 
     if (prev) this.markDeviceButtonListening(prev, false);
@@ -787,10 +804,7 @@ class AudioTransferApp {
       this.showToast(`Latency +10ms -> ${Math.round(this.fixedLatency * 1000)}ms`, 'warning');
     } else if (diff === 0 && this.fixedLatency - this.baseLatency > 0.03) {
       // decay only every other call (~4s) using a toggle flag to slow reduction
-      this._decayToggle = !this._decayToggle;
-      if (this._decayToggle) {
-        this.fixedLatency = +(this.fixedLatency - 0.005).toFixed(3); // -5ms
-      }
+      this.fixedLatency = +(this.fixedLatency - 0.005).toFixed(3); // -5ms
     }
     this.updatePlaybackStatus();
   }
@@ -962,126 +976,91 @@ class AudioTransferApp {
           console.warn('Corrupted audio data detected and cleaned');
         }
 
+        // Aggressive transient detection for modern production
+        if (this.features.transientDetection !== false) {
+          try {
+            for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+              const d = audioBuffer.getChannelData(c);
+              let lastSample = 0;
+              let transientCount = 0;
+              
+              for (let i = 0; i < d.length; i++) {
+                const sample = d[i];
+                const change = Math.abs(sample - lastSample);
+                
+                // More aggressive detection for modern production
+                // Detect both large jumps and cumulative rapid changes
+                if (change > 0.2 || (i > 0 && change > 0.1 && Math.abs(d[i-1] - (i > 1 ? d[i-2] : 0)) > 0.1)) {
+                  transientCount++;
+                  // Softer limiting for transients
+                  const targetMax = 0.7;
+                  if (Math.abs(sample) > targetMax) {
+                    d[i] = Math.sign(sample) * targetMax;
+                  }
+                  
+                  // Smooth the transition more aggressively for modern tracks
+                  if (i > 0 && change > 0.15) {
+                    const blend = 0.3; // More aggressive blending
+                    d[i] = lastSample * (1 - blend) + sample * blend;
+                  }
+                }
+                
+                lastSample = d[i];
+              }
+              
+              if (transientCount > 10) {
+                console.log(`Channel ${c}: ${transientCount} transients detected and smoothed`);
+              }
+            }
+          } catch (e) {
+            console.warn('Transient detection error:', e);
+          }
+        }
+
         try {
           // crossfade / smoothing
           const cfSamples = Math.max(1, Math.min(Math.floor(this.crossfadeMs * sampleRate), Math.floor(audioBuffer.length / 3)));
-          // Optional DC offset correction
-          if (this.features.dcOffsetCorrection) {
+          // --- Minimal guarded crossfade & fade-in (reintroduced safely) ---
+          const sr = audioBuffer.sampleRate;
+          const wantMs = Math.min(this.maxCrossfadeMs, Math.max(this.minCrossfadeMs, (frames / sr) * 1000 * 0.12));
+          const overlapSamples = Math.min(Math.floor(sr * (wantMs / 1000)), Math.floor(frames / 3));
+          if (this.features.overlapAdd && this.lastTailSamples && overlapSamples > 8) {
             for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
               const d = audioBuffer.getChannelData(c);
-              let sum = 0; for (let i = 0; i < d.length; i++) sum += d[i];
-              const mean = sum / d.length; if (Math.abs(mean) > 1e-4) { for (let i = 0; i < d.length; i++) d[i] -= mean; }
-            }
-          }
-          if (this.features.overlapAdd && !forceFadeIn) {
-            for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
-              const d = audioBuffer.getChannelData(c);
-              if (this.lastTailSamples && this.lastTailSamples[c]) {
-                const prev = this.lastTailSamples[c];
-                // ANTI-CRACKLING: Check for corrupted tail data
-                const isCorrupted = prev.some(x => !isFinite(x) || Math.abs(x) > 1.0);
-                if (isCorrupted) {
-                  this.lastTailSamples = null;
-                } else {
-                  const overlap = Math.min(cfSamples, prev.length, d.length);
-                  for (let i = 0; i < overlap; i++) {
-                    const w = i / (overlap - 1 || 1); // 0..1
-                    // Hann window for smoother spectral transition
-                    const inW = 0.5 * (1 - Math.cos(Math.PI * w)); // 0..1
-                    const prevW = 1 - inW;
-                    d[i] = prev[prev.length - overlap + i] * prevW + d[i] * inW;
-                  }
-                  // Boundary slope correction: match initial derivative to previous tail to reduce voiced sustain grain
-                  if (this.features.boundarySlopeCorrection && overlap >= 4) {
-                    const prevTail = prev.subarray(prev.length - overlap);
-                    const prevSlope = prevTail[overlap - 1] - prevTail[overlap - 2];
-                    const curSlope = d[overlap - 1] - d[overlap - 2];
-                    const slopeDiff = curSlope - prevSlope;
-                    if (Math.abs(slopeDiff) > 1e-3) {
-                      // apply very gentle linear correction over first 0.5 ms
-                      const corrSamples = Math.min(Math.floor(sampleRate * 0.0005), d.length - 1);
-                      for (let i = 0; i < corrSamples; i++) {
-                        const f = (1 - i / (corrSamples - 1 || 1));
-                        d[i] -= slopeDiff * 0.25 * f; // gentler taper
-                      }
-                    }
-                  }
-                  // Add ultra-low dither noise to mask residual deterministic boundary energy (first 0.3ms)
-                  if (this.features.boundaryDither) {
-                    const ditherSamples = Math.min(Math.floor(sampleRate * 0.0003), d.length);
-                    for (let i = 0; i < ditherSamples; i++) {
-                      // TPDF dither ~ ±2e-6 scaled by fade-out of effect
-                      const n = ((Math.random() + Math.random()) - 1) * 2e-6 * (1 - i / (ditherSamples - 1 || 1));
-                      d[i] += n;
-                    }
-                  }
-                }
-              } else if (this.features.conditionalFade) {
-                const fadeIn = Math.min(cfSamples, d.length);
-                for (let i = 0; i < fadeIn; i++) {
-                  const w = 0.5 * (1 - Math.cos(Math.PI * i / (fadeIn - 1 || 1)));
-                  d[i] *= w;
-                }
+              const prev = this.lastTailSamples[c];
+              if (!prev) continue;
+              const ov = Math.min(overlapSamples, prev.length, d.length);
+              // Validate previous tail (avoid propagating corruption)
+              let corrupt = false;
+              for (let i = 0; i < ov; i++) { const v = prev[prev.length - ov + i]; if (!isFinite(v) || Math.abs(v) > 1) { corrupt = true; break; } }
+              if (corrupt) continue;
+              for (let i = 0; i < ov; i++) {
+                const w = 0.5 * (1 - Math.cos(Math.PI * i / (ov - 1 || 1))); // Hann
+                const prevW = 1 - w;
+                d[i] = prev[prev.length - ov + i] * prevW + d[i] * w;
               }
             }
           } else if (this.features.conditionalFade) {
-            const fadeInSamples = Math.min(Math.floor(this.fadeTime * sampleRate), Math.floor(audioBuffer.length / 5));
+            // Gentle 0.6ms – 1.2ms fade-in depending on buffer length
+            const fadeSamples = Math.min(Math.max(32, Math.floor(sr * 0.0006)), Math.floor(frames / 4));
             for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
               const d = audioBuffer.getChannelData(c);
-              for (let i = 0; i < fadeInSamples; i++) {
-                const w = 0.5 * (1 - Math.cos(Math.PI * i / (fadeInSamples - 1 || 1)));
+              for (let i = 0; i < fadeSamples; i++) {
+                const w = 0.5 * (1 - Math.cos(Math.PI * i / (fadeSamples - 1 || 1)));
                 d[i] *= w;
               }
             }
           }
-
-          // ANTI-DRUM/BASS CRACKLING: Detect sudden volume jumps (drum hits, bass drops)
-          let peak = 0;
-          let maxChange = 0;
-          for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
-            const d = audioBuffer.getChannelData(c);
-            for (let i = 0; i < d.length; i++) {
-              const a = Math.abs(d[i]); 
-              if (a > peak) peak = a;
-              // Check for sudden sample-to-sample jumps (drum transients)
-              if (i > 0) {
-                const change = Math.abs(d[i] - d[i-1]);
-                if (change > maxChange) maxChange = change;
-              }
-            }
-          }
-          
-          // Limit based on peak OR sudden changes
-          let needsLimiting = false;
-          let scale = 1.0;
-          
-          if (peak > 0.8) {
-            needsLimiting = true;
-            scale = Math.min(scale, 0.8 / peak);
-          }
-          
-          // If there are sudden jumps (drums/bass), be extra aggressive
-          if (maxChange > 0.3) {
-            needsLimiting = true;
-            scale = Math.min(scale, 0.6); // Very conservative for transients
-          }
-          
-          if (needsLimiting) {
-            for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
-              const d = audioBuffer.getChannelData(c);
-              for (let i = 0; i < d.length; i++) d[i] *= scale;
-            }
-          }
-          // Store tails
+          // Store new tails for next crossfade
           this.lastTailSamples = [];
-          const tailKeep = Math.max(cfSamples, 96);
+          const keep = Math.min(overlapSamples * 2 || 128, frames);
           for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
             const d = audioBuffer.getChannelData(c);
-            const keep = Math.min(tailKeep, d.length);
             const tail = new Float32Array(keep);
             tail.set(d.subarray(d.length - keep));
             this.lastTailSamples[c] = tail;
           }
+          // --- end minimal crossfade block ---
         } catch (_) { }
         try { src.start(startAt); } catch (e) { try { src.start(); } catch (_) { } }
         // maintain nextPlayTime for UI backward compatibility
@@ -1187,6 +1166,38 @@ class AudioTransferApp {
     if (!manualIP) { this.showToast('Enter IP:PORT', 'warning'); return; }
     const [ip, port] = manualIP.split(':');
     this.socket.emit('manualConnect', { ip, port: port ? parseInt(port) : 3001 });
+  }
+
+  setupMediaSession(sourceId) {
+    // Tell browser we're playing media to prevent disconnection
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Audio Transfer - Live Stream',
+        artist: `Source: ${sourceId || 'Unknown'}`,
+        album: 'Real-time Audio',
+        artwork: [
+          { src: 'https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/icons/broadcast.svg', sizes: '96x96', type: 'image/svg+xml' }
+        ]
+      });
+      navigator.mediaSession.playbackState = 'playing';
+      navigator.mediaSession.setActionHandler('play', () => {});
+      navigator.mediaSession.setActionHandler('pause', () => {});
+      navigator.mediaSession.setActionHandler('stop', () => { this.stopListening(); });
+    }
+    // Play a silent audio loop to trigger notification
+    const audioEl = document.getElementById('mediaSessionAudio');
+    if (audioEl) {
+      // 1 second of silence
+      const silence = new Uint8Array(44100).map(() => 128);
+      const blob = new Blob([silence], { type: 'audio/wav' });
+      audioEl.src = URL.createObjectURL(blob);
+      audioEl.play().catch(() => {});
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && this.audioContext && this.audioContext.state === 'suspended') {
+        this.audioContext.resume();
+      }
+    });
   }
 
   filterDevices(q) {
