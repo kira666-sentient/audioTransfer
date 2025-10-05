@@ -171,7 +171,7 @@
                                     </div>
                                     <div class="text-center mt-2">
                                         <i class="bi bi-people me-1"></i>
-                                        <span id="connectedCount">0</span> device(s) connected
+                                        <span id="connectedCount" aria-live="polite" aria-label="Devices connected">0</span> device(s) connected
                                     </div>
                                 </div>
                             </div>
@@ -235,6 +235,13 @@
                                                         Loudness Boost
                                                     </label>
                                                     <div><small class="text-muted">Adds mild compression and preamp</small></div>
+                                                </div>
+                                                <div class="form-check mt-3">
+                                                    <input class="form-check-input" type="checkbox" id="reliableDelivery" checked>
+                                                    <label class="form-check-label" for="reliableDelivery">
+                                                        Pure Reliable Delivery
+                                                    </label>
+                                                    <div><small class="text-muted">TCP-like ordering + retransmission, bypasses enhancements</small></div>
                                                 </div>
                                             </div>
                                             <div class="mt-3 justify-content-center" id="playbackStatusRow">
@@ -356,6 +363,21 @@
                                 <div class="text-center">
                                     <p class="text-muted">Audio Transfer App v1.0.0</p>
                                     <p class="text-muted">Built with JavaScript + Bootstrap</p>
+                                    <hr class="text-secondary"/>
+                                    <div class="row g-3 justify-content-center mt-2">
+                                        <div class="col-12 col-md-6">
+                                            <div class="form-check form-switch text-start">
+                                                <input class="form-check-input" type="checkbox" id="logToggle">
+                                                <label class="form-check-label" for="logToggle">Enable Debug Logging</label>
+                                                <div><small class="text-muted">Stores recent internal events (not sent to server)</small></div>
+                                            </div>
+                                        </div>
+                                        <div class="col-12 col-md-6 text-md-start text-center">
+                                            <button class="btn btn-sm btn-outline-info w-100" id="downloadLogs">
+                                                <i class="bi bi-download me-1"></i>Download Logs
+                                            </button>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>

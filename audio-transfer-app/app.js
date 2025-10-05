@@ -37,7 +37,8 @@ class AudioTransferApp {
       dcOffsetCorrection: false, // DISABLED: can cause artifacts
       coalescePackets: false, // DISABLED: was creating periodic beep artifacts at coalesce boundaries
       boundarySlopeCorrection: false, // DISABLED: slope correction causing artifacts
-      boundaryDither: false // DISABLED: dither causing artifacts
+      boundaryDither: false, // DISABLED: dither causing artifacts
+      reliableDelivery: true // Pure reliable delivery: TCP-like ordering + retransmission, bypasses all enhancements - ENABLED BY DEFAULT
     };
     // Minimal smoothing configuration
     this.minCrossfadeMs = 0.8; // very short safe crossfade window
@@ -48,6 +49,16 @@ class AudioTransferApp {
     this.latencyAdjustTimer = null; // interval handle for adaptive latency
     this.deviceRefreshTimer = null; // interval handle for periodic rediscovery
     this.lastSeqMap = {}; // track last sequence per source for gap detection
+    this.lastSequenceMap = {}; // Initialize sequence tracking map
+
+    // Listener count cache (server-sent aggregate)
+    this.listenerCounts = {}; // sourceId -> count
+    this._lastDevices = [];   // last device list for re-render with counts
+
+    // Reliable delivery buffers
+    this.reliableBuffer = new Map(); // sourceId -> { packets: Map(seq -> packet), expectedSeq: number, requestTimer: null }
+    this.retransmissionTimeout = 100; // ms to wait before requesting retransmission
+    this.lastRetransmissionRequest = {}; // Track retransmission requests to prevent flooding
 
     // playback controls
     this.volumeControl = null;
@@ -62,14 +73,62 @@ class AudioTransferApp {
     this.isListening = false;
     this.listeningToSource = null;
     this.packetCount = 0;
+    this.naturalBypass = false; // Natural bypass mode - no EQ/compression
 
     document.addEventListener('DOMContentLoaded', () => this.init());
+    
+    // Cleanup method to prevent memory leaks
+    window.addEventListener('beforeunload', () => this.cleanup());
+  }
+  
+  cleanup() {
+    // Clear all timers to prevent memory leaks
+    if (this.deviceRefreshTimer) {
+      clearInterval(this.deviceRefreshTimer);
+      this.deviceRefreshTimer = null;
+    }
+    if (this.latencyAdjustTimer) {
+      clearInterval(this.latencyAdjustTimer);
+      this.latencyAdjustTimer = null;
+    }
+    
+    // Clear reliable delivery timers
+    for (const [sourceId, buffer] of this.reliableBuffer.entries()) {
+      if (buffer.requestTimer) {
+        clearTimeout(buffer.requestTimer);
+        buffer.requestTimer = null;
+      }
+    }
+    
+    // Stop streaming and listening
+    if (this.isStreaming) {
+      this.stopStreaming().catch(console.warn);
+    }
+    if (this.isListening) {
+      this.stopListening();
+    }
+    
+    // Close socket connection
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
+    }
   }
 
   init() {
     this.initSocket();
     this.setupEventListeners();
     this.detectLocalIP();
+    
+    // Initialize control states based on default settings
+    if (this.features.reliableDelivery) {
+      // Delay initialization to ensure DOM is ready
+      setTimeout(() => {
+        this.disableConflictingControls();
+        this.resolveControlConflicts();
+      }, 100);
+    }
+    
     // periodic passive device rediscovery (covers cases where a broadcast was missed)
     if (!this.deviceRefreshTimer) {
       this.deviceRefreshTimer = setInterval(() => {
@@ -78,22 +137,30 @@ class AudioTransferApp {
           if (this.socket && this.socket.connected) {
             this.discoverDevices();
           }
-        } catch (_) { }
+        } catch (error) { 
+          console.warn('Device refresh error:', error);
+        }
       }, 7000);
     }
     // adaptive latency manager – gently increases on underruns / reduces when stable
     if (this.features.adaptiveLatency && !this.latencyAdjustTimer) {
-      this.latencyAdjustTimer = setInterval(() => this.autoAdjustLatency(), 2000);
+      this.latencyAdjustTimer = setInterval(() => {
+        try {
+          this.autoAdjustLatency();
+        } catch (error) {
+          console.warn('Adaptive latency error:', error);
+        }
+      }, 2000);
     }
   }
 
   initSocket() {
     if (this.socket) return;
 
-    // Check for mobile HTTPS requirement
+    // Check for mobile HTTPS requirement - show warning but allow connection
     const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     if (isMobile && location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-      this.showToast('Mobile devices require HTTPS for audio features. Please use https:// in the URL.', 'error');
+      this.showToast('⚠️ Mobile on HTTP: Streaming (mic/screen) disabled. Listening works fine. Use HTTPS for full features.', 'warning');
     }
 
     this.socket = io({
@@ -124,6 +191,64 @@ class AudioTransferApp {
 
     this.socket.on('deviceList', (devices) => this.updateDeviceList(devices));
 
+    this.socket.on('streamingStarted', (response) => {
+      console.log('Streaming started successfully:', response);
+      // Already handled in startStreaming success path
+    });
+
+    this.socket.on('streamingFailed', (response) => {
+      console.error('Streaming failed to start:', response.message);
+      this.showToast('Streaming failed: ' + (response.message || 'Unknown error'), 'error');
+      
+      // Reset UI to starting state
+      const startBtn = document.getElementById('startStreamBtn');
+      const stopBtn = document.getElementById('stopStreamBtn');
+      const liveIndicator = document.getElementById('liveIndicator');
+      const serverStatus = document.getElementById('serverStatus');
+      
+      if (startBtn) { 
+        startBtn.disabled = false; 
+        startBtn.innerHTML = '<i class="bi bi-play-fill me-2"></i>Start Streaming';
+        startBtn.classList.remove('d-none');
+      }
+      if (stopBtn) stopBtn.classList.add('d-none');
+      if (liveIndicator) liveIndicator.classList.add('d-none');
+      if (serverStatus) { 
+        serverStatus.textContent = 'ONLINE'; 
+        serverStatus.className = 'badge bg-success'; 
+      }
+      
+      // Clean up any partial streaming state
+      this.isStreaming = false;
+      if (this.mediaStream) { 
+        this.mediaStream.getTracks().forEach(t => t.stop()); 
+        this.mediaStream = null; 
+      }
+    });
+
+    this.socket.on('listenerCounts', (counts) => {
+      // Update the live indicator with listener count for this device
+      if (!counts || typeof counts !== 'object') return;
+      this.listenerCounts = counts;
+      // re-render with cached device list if present
+      if (this._lastDevices.length) this.updateDeviceList(this._lastDevices);
+      this._updateStreamingUI && this._updateStreamingUI();
+      
+      try {
+        if (this.isStreaming && this.socket && this.socket.id) {
+          // Robust handling: ensure counts is valid object and socket.id exists
+          const myListeners = (counts && typeof counts === 'object' && counts[this.socket.id]) ? counts[this.socket.id] : 0;
+          const connectedCountEl = document.getElementById('connectedCount');
+          if (connectedCountEl) {
+            connectedCountEl.textContent = myListeners.toString();
+          }
+        }
+      } catch (error) {
+        // Silently handle any unexpected errors without breaking the app
+        console.warn('Error updating listener count:', error);
+      }
+    });
+
     this.socket.on('streamStarted', (info) => {
       this.showToast(`${info.clientName || 'Device'} started streaming`, 'success');
       this.socket.emit('discoverDevices');
@@ -131,6 +256,16 @@ class AudioTransferApp {
 
     this.socket.on('streamStopped', (info) => {
       this.showToast(`${info.clientName || 'Device'} stopped streaming`, 'info');
+      
+      // Clean up reliable buffer for this source
+      if (info.clientId && this.reliableBuffer.has(info.clientId)) {
+        const buffer = this.reliableBuffer.get(info.clientId);
+        if (buffer.requestTimer) {
+          clearInterval(buffer.requestTimer);
+        }
+        this.reliableBuffer.delete(info.clientId);
+      }
+      
       this.socket.emit('discoverDevices');
       if (this.listeningToSource === info.clientId) this.stopListening();
     });
@@ -138,12 +273,23 @@ class AudioTransferApp {
     // audioStream: { sourceId, sampleRate, channels, timestamp, data: ArrayBuffer/TypedArray }
     this.socket.on('audioStream', (streamData) => {
       try {
+        if (!streamData || !streamData.sourceId) {
+          console.warn('Invalid stream data received');
+          return;
+        }
+        
         this.packetCount++;
         const pc = document.getElementById('packetCount');
         if (pc) pc.textContent = this.packetCount;
+        
+        // Initialize lastSequenceMap if not exists
+        if (!this.lastSequenceMap) {
+          this.lastSequenceMap = {};
+        }
+        
         // Sequence gap detection to avoid bursty distortions (radio noise)
         if (streamData && typeof streamData.seq === 'number') {
-          const last = this.lastSeqMap[streamData.sourceId];
+          const last = this.lastSequenceMap[streamData.sourceId];
           if (last != null) {
             const gap = streamData.seq - last;
             if (gap > 200) {
@@ -158,10 +304,12 @@ class AudioTransferApp {
               this.audioQueue.push({ data: silence, channels: ch, sampleRate: sr, timestamp: Date.now() - 5 });
             }
           }
-          this.lastSeqMap[streamData.sourceId] = streamData.seq;
+          this.lastSequenceMap[streamData.sourceId] = streamData.seq;
         }
         if (this.isListening && this.listeningToSource === streamData.sourceId) {
-          if (this.features.coalescePackets) {
+          if (this.features.reliableDelivery) {
+            this.handleReliableDelivery(streamData);
+          } else if (this.features.coalescePackets) {
             const ch = streamData.channels || 1;
             const sr = streamData.sampleRate || 48000;
             if (this.coalesce.channels == null) this.coalesce.channels = ch;
@@ -213,6 +361,12 @@ class AudioTransferApp {
     // keep rateLimit handling but unobtrusive
     this.socket.on('rateLimitWarning', () => {
       this.showToast('Server requested rate reduction', 'warning');
+    });
+
+    this.socket.on('retransmittedPackets', (packets) => {
+      if (!this.features.reliableDelivery) return;
+      // Process retransmitted packets
+      packets.forEach(packet => this.handleReliableDelivery(packet));
     });
   }
 
@@ -343,10 +497,10 @@ class AudioTransferApp {
 
   async startStreaming() {
     try {
-      // Check for mobile browser limitations
+      // Check for mobile browser limitations for streaming only
       const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
       if (isMobile && location.protocol !== 'https:' && location.hostname !== 'localhost') {
-        this.showToast('HTTPS required for mobile devices. Use https:// in the URL.', 'error');
+        this.showToast('🚫 Mobile streaming requires HTTPS for microphone/screen access. Use https:// to stream.', 'error');
         return;
       }
 
@@ -373,6 +527,13 @@ class AudioTransferApp {
 
       // Capture context: use default sampleRate (browser chosen) but capture sampleRate metadata will be sent
       this.captureContext = new (window.AudioContext || window.webkitAudioContext)();
+      
+      // Ensure capture context is resumed if suspended (critical for Chrome)
+      if (this.captureContext.state === 'suspended') {
+        await this.captureContext.resume();
+        console.log('Capture audio context resumed');
+      }
+      
       this.captureSourceNode = this.captureContext.createMediaStreamSource(this.mediaStream);
 
       // muted gain to keep graph alive, avoid feedback
@@ -456,7 +617,22 @@ class AudioTransferApp {
       }
 
       const name = await this.getDeviceName();
-      this.socket.emit('startStreaming', { source, quality, deviceName: name });
+      
+      // Use callback to get immediate response about streaming start
+      this.socket.emit('startStreaming', { source, quality, deviceName: name }, (response) => {
+        if (!response) {
+          console.warn('No response from server for startStreaming');
+          return;
+        }
+        
+        if (response.success) {
+          // Success already handled by streamingStarted event
+          console.log('Server confirmed streaming started');
+        } else {
+          // Error will be handled by streamingFailed event
+          console.warn('Server rejected streaming start:', response.message);
+        }
+      });
 
       this.isStreaming = true;
       if (startBtn) startBtn.classList.add('d-none');
@@ -664,6 +840,13 @@ class AudioTransferApp {
     // EQ controls
     document.querySelectorAll('.eq-band').forEach(slider => {
       slider.addEventListener('input', (e) => {
+        // Prevent EQ changes when reliable delivery is active
+        if (this.features.reliableDelivery) {
+          this.showToast('EQ disabled in reliable delivery mode', 'warning');
+          e.target.value = 0; // Reset to flat
+          return;
+        }
+        
         const band = e.target.dataset.band;
         const gain = parseFloat(e.target.value);
         if (this.eqNodes[band]) {
@@ -676,6 +859,12 @@ class AudioTransferApp {
     const eqPresetSelect = document.getElementById('eqPreset');
     if (eqPresetSelect) {
       eqPresetSelect.addEventListener('change', (e) => {
+        // Prevent EQ changes when reliable delivery is active
+        if (this.features.reliableDelivery) {
+          this.showToast('EQ disabled in reliable delivery mode', 'warning');
+          e.target.value = 'flat'; // Reset to flat
+          return;
+        }
         this.applyEQPreset(e.target.value);
       });
     }
@@ -684,8 +873,16 @@ class AudioTransferApp {
     document.querySelectorAll('input[name="playbackMode"]').forEach(radio => {
       radio.addEventListener('change', (e) => {
         if (e.target.checked) {
-          this.playbackMode = e.target.id.replace('mode', '').toLowerCase();
+          // Map HTML IDs to internal mode names
+          const modeMap = {
+            'modeLowLat': 'lowlat',
+            'modeUltraLow': 'ultralow', 
+            'modeHighStab': 'highstab'
+          };
+          
+          this.playbackMode = modeMap[e.target.id] || 'lowlat';
           this.updatePlaybackMode();
+          console.log('Playback mode changed to:', this.playbackMode);
         }
       });
     });
@@ -695,7 +892,140 @@ class AudioTransferApp {
 
     // Loudness boost
     document.getElementById('loudnessBoost')?.addEventListener('change', (e) => {
-      this.toggleLoudnessBoost(e.target.checked);
+      try {
+        // Check if control is disabled (should not respond to events)
+        if (e.target.disabled) {
+          e.target.checked = !e.target.checked; // Revert the change
+          return;
+        }
+        
+        // Validate audio context exists (only when enabling)
+        if (e.target.checked && !this.audioContext) {
+          this.showToast('Cannot enable loudness boost: audio context not initialized', 'error');
+          e.target.checked = false;
+          return;
+        }
+
+        // Validate reliable delivery conflict
+        if (e.target.checked && this.features.reliableDelivery) {
+          this.showToast('Cannot enable loudness boost while reliable delivery is active', 'warning');
+          e.target.checked = false;
+          return;
+        }
+
+        this.toggleLoudnessBoost(e.target.checked);
+      } catch (error) {
+        console.error('Error toggling loudness boost:', error);
+        this.showToast('Failed to toggle loudness boost: ' + error.message, 'error');
+        e.target.checked = !e.target.checked; // Revert the toggle
+      }
+    });
+
+    // Reliable delivery toggle
+    document.getElementById('reliableDelivery')?.addEventListener('change', (e) => {
+      try {
+        // Store previous state for rollback if needed
+        const previousState = this.features.reliableDelivery;
+        
+        // Note: Audio context is created when listening starts, so we don't require it for reliable delivery toggle
+        // Note: Browser support validation simplified to only check Web Audio API (done in validateBrowserSupport)
+
+        // Attempt to change state
+        this.features.reliableDelivery = e.target.checked;
+        
+        // Clear any existing reliable buffers and reset state
+        try {
+          this.reliableBuffer.clear();
+          this.resetAudioTiming();
+        } catch (stateError) {
+          console.warn('Error clearing reliable delivery state:', stateError);
+          // Reinitialize buffers if clearing failed
+          this.reliableBuffer = new Map();
+          this.lastRetransmissionRequest = {};
+        }
+        
+        if (e.target.checked) {
+          // Enabling reliable delivery
+          try {
+            this.disableConflictingControls();
+            this.showToast('Pure reliable delivery enabled - TCP-like ordering, no enhancements', 'info');
+          } catch (enableError) {
+            console.error('Error enabling reliable delivery:', enableError);
+            // Rollback state
+            this.features.reliableDelivery = previousState;
+            e.target.checked = previousState;
+            this.showToast('Failed to enable reliable delivery: ' + enableError.message, 'error');
+            return;
+          }
+        } else {
+          // Disabling reliable delivery
+          try {
+            this.enableAllControls();
+            this.showToast('Standard streaming mode enabled', 'info');
+          } catch (disableError) {
+            console.error('Error disabling reliable delivery:', disableError);
+            // Rollback state
+            this.features.reliableDelivery = previousState;
+            e.target.checked = previousState;
+            this.showToast('Failed to disable reliable delivery: ' + disableError.message, 'error');
+            return;
+          }
+        }
+        
+        // Validate final state and refresh UI
+        const validation = this.resolveControlConflicts();
+        if (validation.issues.length > 0) {
+          console.warn('Control state issues after reliable delivery toggle:', validation.issues);
+        }
+        
+        // Force refresh of all control states to ensure consistency
+        this.refreshAllControlStates();
+        
+      } catch (error) {
+        console.error('Critical error toggling reliable delivery:', error);
+        this.showToast('Failed to toggle reliable delivery: ' + error.message, 'error');
+        
+        // Emergency rollback - try to restore a safe state
+        try {
+          this.features.reliableDelivery = false;
+          e.target.checked = false;
+          this.reliableBuffer.clear();
+          this.resetAudioTiming();
+          this.enableAllControls();
+        } catch (rollbackError) {
+          console.error('Emergency rollback failed:', rollbackError);
+          this.showToast('Critical error - please refresh the page', 'error');
+        }
+      }
+    });
+
+    // Natural bypass toggle
+    document.getElementById('naturalBypass')?.addEventListener('change', (e) => {
+      try {
+        // Check if control is disabled (should not respond to events)
+        if (e.target.disabled) {
+          e.target.checked = !e.target.checked; // Revert the change
+          return;
+        }
+        
+        // Prevent natural bypass when reliable delivery is active (redundant)
+        if (e.target.checked && this.features.reliableDelivery) {
+          this.showToast('Natural bypass not needed - reliable delivery already bypasses all enhancements', 'info');
+          e.target.checked = false;
+          return;
+        }
+        
+        this.naturalBypass = e.target.checked;
+        if (e.target.checked) {
+          this.showToast('Natural bypass enabled - EQ and compression disabled', 'info');
+        } else {
+          this.showToast('Natural bypass disabled - EQ and compression enabled', 'info');
+        }
+      } catch (error) {
+        console.error('Error toggling natural bypass:', error);
+        this.showToast('Failed to toggle natural bypass: ' + error.message, 'error');
+        e.target.checked = !e.target.checked; // Revert the toggle
+      }
     });
   }
 
@@ -729,8 +1059,17 @@ class AudioTransferApp {
     };
 
     const mode = modes[this.playbackMode] || modes.lowlat;
+    const oldLatency = this.fixedLatency;
     this.fixedLatency = mode.latency;
+    
+    // Reset timing when mode changes to apply new latency, but only if currently listening
+    if (this.isListening && oldLatency !== this.fixedLatency) {
+      this.resetAudioTiming();
+      this.showToast(`Latency mode changed to ${this.playbackMode.toUpperCase()} (${Math.round(this.fixedLatency * 1000)}ms)`, 'info');
+    }
+    
     this.updatePlaybackStatus();
+    console.log(`Playback mode updated: ${this.playbackMode}, latency: ${this.fixedLatency}s`);
   }
 
   resetSync() {
@@ -857,6 +1196,195 @@ class AudioTransferApp {
     if (!this.nextPlayTime) this.nextPlayTime = this.audioContext.currentTime + this.fixedLatency;
   }
 
+  // Reliable delivery: TCP-like packet ordering and retransmission
+  handleReliableDelivery(streamData) {
+    const sourceId = streamData.sourceId;
+    if (!this.reliableBuffer.has(sourceId)) {
+      this.reliableBuffer.set(sourceId, {
+        packets: new Map(),
+        expectedSeq: streamData.seq || 0,
+        requestTimer: null,
+        lastProcessedTime: Date.now()
+      });
+    }
+
+    const buffer = this.reliableBuffer.get(sourceId);
+    const seq = streamData.seq;
+
+    // Validate sequence number
+    if (typeof seq !== 'number' || seq < 0) {
+      console.warn('Invalid sequence number:', seq);
+      return;
+    }
+
+    // Store packet
+    buffer.packets.set(seq, streamData);
+
+    // Process consecutive packets starting from expectedSeq
+    let processed = 0;
+    while (buffer.packets.has(buffer.expectedSeq) && processed < 10) { // Limit processing to prevent blocking
+      const packet = buffer.packets.get(buffer.expectedSeq);
+      buffer.packets.delete(buffer.expectedSeq);
+      
+      // Pure delivery: bypass all audio enhancements but maintain timing
+      this.playAudioDataPure(packet);
+      buffer.expectedSeq++;
+      buffer.lastProcessedTime = Date.now();
+      processed++;
+    }
+
+    // Check for gaps and request retransmission with timeout
+    if (seq > buffer.expectedSeq) {
+      if (!buffer.requestTimer) {
+        buffer.requestTimer = setTimeout(() => {
+          // Only request if we still have a gap after timeout
+          if (seq > buffer.expectedSeq) {
+            this.requestRetransmission(sourceId, buffer.expectedSeq, seq - 1);
+          }
+          buffer.requestTimer = null;
+        }, this.retransmissionTimeout);
+      }
+    }
+
+    // Cleanup very old packets to prevent memory buildup
+    const cutoffTime = Date.now() - 5000; // 5 seconds
+    if (buffer.lastProcessedTime < cutoffTime) {
+      const minSeq = Math.min(...buffer.packets.keys());
+      if (minSeq > buffer.expectedSeq + 100) { // Large gap, reset
+        console.log('Large gap detected, resetting reliable buffer for source:', sourceId);
+        buffer.expectedSeq = minSeq;
+        buffer.lastProcessedTime = Date.now();
+      }
+    }
+  }
+
+  // Request missing packets with throttling
+  requestRetransmission(sourceId, startSeq, endSeq) {
+    if (!this.socket) return;
+    
+    // Throttle retransmission requests to prevent flooding
+    const now = Date.now();
+    const key = `${sourceId}-${startSeq}-${endSeq}`;
+    if (this.lastRetransmissionRequest && this.lastRetransmissionRequest[key]) {
+      const timeSinceLastRequest = now - this.lastRetransmissionRequest[key];
+      if (timeSinceLastRequest < this.retransmissionTimeout) {
+        return; // Too soon, skip request
+      }
+    }
+    
+    if (!this.lastRetransmissionRequest) {
+      this.lastRetransmissionRequest = {};
+    }
+    this.lastRetransmissionRequest[key] = now;
+    
+    // Limit range to prevent excessive requests
+    const maxRange = 50;
+    if (endSeq - startSeq > maxRange) {
+      endSeq = startSeq + maxRange;
+    }
+    
+    console.log(`Requesting retransmission for ${sourceId}: seq ${startSeq}-${endSeq}`);
+    this.socket.emit('requestRetransmission', {
+      sourceId: sourceId,
+      startSeq: startSeq,
+      endSeq: endSeq
+    });
+  }
+
+  // Pure audio playback: no enhancements, direct to audio context with proper timing
+  async playAudioDataPure(streamData) {
+    if (!this.audioContext || !streamData || !streamData.data) return;
+
+    // Ensure audio context is running
+    if (this.audioContext.state === 'suspended') {
+      try {
+        await this.audioContext.resume();
+      } catch (e) {
+        console.warn('Failed to resume audio context:', e);
+        return;
+      }
+    }
+
+    // Normalize buffer
+    let srcBuffer;
+    if (streamData.data instanceof ArrayBuffer) srcBuffer = streamData.data;
+    else if (ArrayBuffer.isView(streamData.data)) srcBuffer = streamData.data.buffer.slice(streamData.data.byteOffset, streamData.data.byteOffset + streamData.data.byteLength);
+    else if (Array.isArray(streamData.data)) { const t = new Float32Array(streamData.data.length); t.set(streamData.data); srcBuffer = t.buffer; }
+    else return;
+
+    const srcRate = streamData.sampleRate || 48000;
+    const channels = streamData.channels || 1;
+    let interleaved = new Float32Array(srcBuffer);
+
+    // Resample if needed
+    const targetRate = this.audioContext.sampleRate;
+    if (srcRate !== targetRate) {
+      try {
+        interleaved = await this.resampleInterleaved(interleaved, srcRate, targetRate, channels);
+      } catch (e) {
+        console.warn('resample error, using raw buffer', e);
+      }
+    }
+
+    // Create audio buffer
+    const frames = Math.floor(interleaved.length / channels);
+    if (frames <= 0) {
+      console.warn('Empty audio buffer, skipping playback');
+      return;
+    }
+
+    try {
+      const audioBuffer = this.audioContext.createBuffer(channels, frames, targetRate);
+      for (let c = 0; c < channels; c++) {
+        const chData = audioBuffer.getChannelData(c);
+        for (let i = 0, k = c; i < frames; i++, k += channels) {
+          const sample = interleaved[k] || 0;
+          // Clamp values to prevent distortion
+          chData[i] = Math.max(-1, Math.min(1, sample));
+        }
+      }
+
+      const src = this.audioContext.createBufferSource();
+      src.buffer = audioBuffer;
+      
+      // Ensure playback gain exists and is connected
+      if (!this.playbackGain) {
+        console.warn('Playback gain not initialized, creating default');
+        this.playbackGain = this.audioContext.createGain();
+        this.playbackGain.connect(this.audioContext.destination);
+      }
+      
+      src.connect(this.playbackGain);
+
+      // FIXED: Proper timing coordination for reliable delivery
+      const now = this.audioContext.currentTime;
+      
+      // Initialize timing if needed
+      if (this.nextPlayTime === 0 || this.nextPlayTime < now) {
+        this.nextPlayTime = now + this.fixedLatency;
+        this._anchorTime = now;
+        this.playCursorSamples = 0;
+      }
+
+      // Schedule at proper time to prevent overlapping and slow motion
+      const playTime = Math.max(this.nextPlayTime, now + 0.001); // Minimum 1ms ahead
+      
+      src.start(playTime);
+      this.activeSources.add(src);
+      src.onended = () => this.activeSources.delete(src);
+      
+      // Update timing for next buffer
+      const bufferDuration = frames / targetRate;
+      this.nextPlayTime = playTime + bufferDuration;
+      this.playCursorSamples += frames;
+      
+    } catch (e) {
+      console.error('Failed to create or start audio source:', e);
+      // Try to recover by resetting timing
+      this.resetAudioTiming();
+    }
+  }
+
   // Play audioData: resample if needed and preserve channels (stereo -> stereo; dual-mono -> dual-mono; mono -> mono)
   async playAudioData(streamData) {
     if (!this.audioContext) return;
@@ -937,6 +1465,11 @@ class AudioTransferApp {
         const ch = item.channels || 1;
         const frames = Math.floor(item.data.length / ch);
 
+        if (frames <= 0) {
+          console.warn('Empty audio buffer in queue, skipping');
+          continue;
+        }
+
         const audioBuffer = this.audioContext.createBuffer(ch, frames, item.sampleRate || this.audioContext.sampleRate);
         for (let c = 0; c < ch; c++) {
           const chData = audioBuffer.getChannelData(c);
@@ -949,8 +1482,11 @@ class AudioTransferApp {
         // Connect through EQ chain if available, otherwise direct to gain
         if (this.eqNodes[60]) {
           src.connect(this.eqNodes[60]);
-        } else {
+        } else if (this.playbackGain) {
           src.connect(this.playbackGain);
+        } else {
+          // Fallback: connect directly to destination if playbackGain is null
+          src.connect(this.audioContext.destination);
         }
 
         // SIMPLIFIED SCHEDULER: Use basic Web Audio timing
@@ -1019,9 +1555,10 @@ class AudioTransferApp {
 
         try {
           // crossfade / smoothing
-          const cfSamples = Math.max(1, Math.min(Math.floor(this.crossfadeMs * sampleRate), Math.floor(audioBuffer.length / 3)));
-          // --- Minimal guarded crossfade & fade-in (reintroduced safely) ---
           const sr = audioBuffer.sampleRate;
+          const frames = audioBuffer.length;
+          const cfSamples = Math.max(1, Math.min(Math.floor(this.crossfadeMs * sr), Math.floor(frames / 3)));
+          // --- Minimal guarded crossfade & fade-in (reintroduced safely) ---
           const wantMs = Math.min(this.maxCrossfadeMs, Math.max(this.minCrossfadeMs, (frames / sr) * 1000 * 0.12));
           const overlapSamples = Math.min(Math.floor(sr * (wantMs / 1000)), Math.floor(frames / 3));
           if (this.features.overlapAdd && this.lastTailSamples && overlapSamples > 8) {
@@ -1086,6 +1623,10 @@ class AudioTransferApp {
     const listEl = document.getElementById('deviceList');
     const countEl = document.getElementById('onlineDeviceCount');
     if (!listEl) return;
+    
+    // Cache device list for re-rendering with listener counts
+    this._lastDevices = devices.slice();
+    
     // Preserve current listening source to restore button labels without user-visible flicker
     const currentListening = this.listeningToSource;
     listEl.innerHTML = '';
@@ -1094,7 +1635,12 @@ class AudioTransferApp {
       const row = document.createElement('div');
       row.className = 'd-flex align-items-center justify-content-between py-2 border-bottom';
       const left = document.createElement('div');
-      left.innerHTML = `<div class="fw-semibold">${d.name || d.id}</div><div class="text-muted small">${d.ip || ''}</div>`;
+      
+      // Add listener count badge for streaming devices
+      const lCount = this.listenerCounts[d.id] || 0;
+      const listenerBadge = d.isStreaming ? `<span class="badge bg-primary ms-1" title="listeners">${lCount}</span>` : '';
+      
+      left.innerHTML = `<div class="fw-semibold">${d.name || d.id} ${listenerBadge}</div><div class="text-muted small">${d.ip || ''}</div>`;
       const right = document.createElement('div');
 
       if (d.isStreaming) {
@@ -1200,6 +1746,391 @@ class AudioTransferApp {
     });
   }
 
+  // Validate browser support for audio features
+  validateBrowserSupport() {
+    try {
+      // Check for basic Web Audio API support (required for reliable delivery)
+      if (!window.AudioContext && !window.webkitAudioContext) {
+        return false;
+      }
+      
+      // Note: We don't check for getUserMedia here because reliable delivery
+      // is primarily for playback/listening, not for streaming/capture
+      
+      return true;
+    } catch (error) {
+      console.warn('Browser support validation failed:', error);
+      return false;
+    }
+  }
+
+  // Reset audio timing state
+  resetAudioTiming() {
+    try {
+      this.nextPlayTime = 0;
+      this.playCursorSamples = 0;
+      this._anchorTime = this.audioContext ? this.audioContext.currentTime : 0;
+      this.audioQueue = [];
+      
+      // Stop all active sources
+      for (const source of this.activeSources) {
+        try { 
+          if (source.playbackState !== source.FINISHED_STATE) {
+            source.stop(0); 
+          }
+        } catch (error) { 
+          console.warn('Error stopping audio source:', error);
+        }
+      }
+      this.activeSources.clear();
+      
+      // Clear retransmission timers and state
+      for (const [sourceId, buffer] of this.reliableBuffer.entries()) {
+        if (buffer.requestTimer) {
+          clearTimeout(buffer.requestTimer);
+          buffer.requestTimer = null;
+        }
+      }
+      this.lastRetransmissionRequest = {};
+      
+      console.log('Audio timing reset completed');
+    } catch (error) {
+      console.warn('Error resetting audio timing:', error);
+    }
+  }
+
+  // Disable controls that conflict with reliable delivery
+  disableConflictingControls() {
+    try {
+      // Disable loudness boost
+      const loudnessBoostToggle = document.getElementById('loudnessBoost');
+      if (loudnessBoostToggle) {
+        if (loudnessBoostToggle.checked) {
+          loudnessBoostToggle.checked = false;
+          this.toggleLoudnessBoost(false);
+        }
+        loudnessBoostToggle.disabled = true;
+      }
+      
+      // Disable natural bypass (redundant)
+      const naturalBypassToggle = document.getElementById('naturalBypass');
+      if (naturalBypassToggle) {
+        if (naturalBypassToggle.checked) {
+          naturalBypassToggle.checked = false;
+          this.naturalBypass = false;
+        }
+        naturalBypassToggle.disabled = true;
+      }
+      
+      // Reset EQ to flat
+      const eqPresetSelect = document.getElementById('eqPreset');
+      if (eqPresetSelect) {
+        eqPresetSelect.value = 'flat';
+      }
+      
+      // Reset EQ sliders to 0
+      document.querySelectorAll('.eq-band').forEach(slider => {
+        slider.value = 0;
+      });
+      
+      // Visually disable EQ controls
+      this.setEQControlsState(false);
+      
+      // Visually disable other conflicting controls - BE SPECIFIC to avoid disabling entire tabs or volume controls
+      const loudnessContainer = document.getElementById('loudnessBoost')?.closest('.form-check');
+      const naturalBypassContainer = document.getElementById('naturalBypass')?.closest('.form-check');
+      
+      if (loudnessContainer) {
+        loudnessContainer.style.opacity = '0.5';
+        loudnessContainer.style.pointerEvents = 'none';
+      }
+      
+      if (naturalBypassContainer) {
+        naturalBypassContainer.style.opacity = '0.5'; 
+        naturalBypassContainer.style.pointerEvents = 'none';
+      }
+      
+      console.log('Conflicting controls disabled for reliable delivery mode');
+    } catch (error) {
+      console.warn('Error disabling conflicting controls:', error);
+    }
+  }
+
+  // Enable all controls when reliable delivery is disabled
+  enableAllControls() {
+    try {
+      // Re-enable EQ controls
+      this.setEQControlsState(true);
+      
+      // Re-enable natural bypass toggle
+      const naturalBypassToggle = document.getElementById('naturalBypass');
+      if (naturalBypassToggle) {
+        naturalBypassToggle.disabled = false;
+      }
+      
+      // Re-enable loudness boost toggle  
+      const loudnessBoostToggle = document.getElementById('loudnessBoost');
+      if (loudnessBoostToggle) {
+        loudnessBoostToggle.disabled = false;
+      }
+      
+      // Reset any visual styling that was applied - BE SPECIFIC to match the disable function
+      const loudnessContainer = document.getElementById('loudnessBoost')?.closest('.form-check');
+      const naturalBypassContainer = document.getElementById('naturalBypass')?.closest('.form-check');
+      
+      if (loudnessContainer) {
+        loudnessContainer.style.opacity = '1';
+        loudnessContainer.style.pointerEvents = 'auto';
+      }
+      
+      if (naturalBypassContainer) {
+        naturalBypassContainer.style.opacity = '1';
+        naturalBypassContainer.style.pointerEvents = 'auto';
+      }
+      
+      console.log('All controls re-enabled for standard mode');
+    } catch (error) {
+      console.warn('Error enabling controls:', error);
+    }
+  }
+
+  // Set EQ controls enabled/disabled state
+  setEQControlsState(enabled) {
+    try {
+      // Disable EQ preset dropdown
+      const eqPresetSelect = document.getElementById('eqPreset');
+      if (eqPresetSelect) {
+        eqPresetSelect.disabled = !enabled;
+      }
+      
+      // Disable all EQ band sliders
+      const eqBands = document.querySelectorAll('.eq-band');
+      if (eqBands) {
+        eqBands.forEach(slider => {
+          if (slider) {
+            slider.disabled = !enabled;
+          }
+        });
+      }
+      
+      // Also handle any other EQ-related inputs that might exist
+      const eqControls = document.querySelectorAll('input[data-band], select[data-band]');
+      if (eqControls) {
+        eqControls.forEach(control => {
+          if (control) {
+            control.disabled = !enabled;
+          }
+        });
+      }
+      
+      // Apply visual styling to ONLY the EQ-specific areas, not the entire card
+      // Target the EQ preset container specifically
+      const eqPresetContainer = eqPresetSelect?.closest('.col-12.col-lg-5');
+      if (eqPresetContainer) {
+        if (enabled) {
+          eqPresetContainer.style.opacity = '1';
+          eqPresetContainer.style.pointerEvents = 'auto';
+          eqPresetContainer.classList.remove('eq-disabled');
+        } else {
+          eqPresetContainer.style.opacity = '0.5';
+          eqPresetContainer.style.pointerEvents = 'none';
+          eqPresetContainer.classList.add('eq-disabled');
+        }
+      }
+      
+      // Target the EQ sliders container specifically
+      const eqSlidersContainer = document.getElementById('eqSliders');
+      if (eqSlidersContainer) {
+        if (enabled) {
+          eqSlidersContainer.style.opacity = '1';
+          eqSlidersContainer.style.pointerEvents = 'auto';
+          eqSlidersContainer.classList.remove('eq-disabled');
+        } else {
+          eqSlidersContainer.style.opacity = '0.5';
+          eqSlidersContainer.style.pointerEvents = 'none';
+          eqSlidersContainer.classList.add('eq-disabled');
+        }
+      }
+      
+      console.log(`EQ controls ${enabled ? 'enabled' : 'disabled'}`);
+    } catch (error) {
+      console.warn('Error setting EQ controls state:', error);
+    }
+  }
+
+  // Validate control combinations and resolve conflicts
+  validateControlState() {
+    const issues = [];
+    const warnings = [];
+    
+    // Get current control states
+    const reliableDelivery = this.features.reliableDelivery;
+    const loudnessBoost = document.getElementById('loudnessBoost')?.checked || false;
+    const naturalBypass = this.naturalBypass || false;
+    const audioContextExists = !!this.audioContext;
+    const isListening = this.isListening;
+    
+    // Check for conflicting states
+    if (reliableDelivery) {
+      if (loudnessBoost) {
+        issues.push('Loudness boost should be disabled in reliable delivery mode');
+      }
+      
+      if (naturalBypass) {
+        warnings.push('Natural bypass is redundant in reliable delivery mode');
+      }
+      
+      // Check if EQ controls are enabled when they shouldn't be
+      const eqPreset = document.getElementById('eqPreset')?.value;
+      if (eqPreset && eqPreset !== 'flat') {
+        warnings.push('EQ should be reset to flat in reliable delivery mode');
+      }
+      
+      const eqBands = document.querySelectorAll('.eq-band');
+      let hasNonZeroEQ = false;
+      eqBands.forEach(band => {
+        if (parseFloat(band.value) !== 0) {
+          hasNonZeroEQ = true;
+        }
+      });
+      if (hasNonZeroEQ) {
+        warnings.push('EQ bands should be reset to 0 in reliable delivery mode');
+      }
+    }
+    
+    // Check for audio context dependency issues
+    if (!audioContextExists && isListening) {
+      if (loudnessBoost) {
+        issues.push('Loudness boost requires audio context but none exists during listening');
+      }
+    }
+    
+    // Check for impossible states
+    if (naturalBypass && loudnessBoost) {
+      issues.push('Natural bypass and loudness boost cannot both be active');
+    }
+    
+    // Check for disabled control states that are somehow active
+    const loudnessToggle = document.getElementById('loudnessBoost');
+    const naturalToggle = document.getElementById('naturalBypass');
+    
+    if (loudnessToggle?.disabled && loudnessToggle.checked) {
+      issues.push('Loudness boost is disabled but still checked');
+    }
+    
+    if (naturalToggle?.disabled && naturalToggle.checked) {
+      issues.push('Natural bypass is disabled but still checked');
+    }
+    
+    // Check for timing/latency conflicts during playback
+    if (isListening && this.nextPlayTime > 0) {
+      const timeDrift = this.audioContext?.currentTime - this._anchorTime;
+      if (timeDrift > 5) { // More than 5 seconds drift
+        warnings.push('Significant audio timing drift detected');
+      }
+    }
+    
+    return { issues, warnings };
+  }
+
+  // Refresh all control states to ensure consistency after mode changes
+  refreshAllControlStates() {
+    try {
+      // Get current state
+      const reliableDelivery = this.features.reliableDelivery;
+      const naturalBypass = this.naturalBypass;
+      
+      // Get DOM elements
+      const reliableDeliveryCheckbox = document.getElementById('reliableDelivery');
+      const loudnessBoostCheckbox = document.getElementById('loudnessBoost');
+      const naturalBypassCheckbox = document.getElementById('naturalBypass');
+      const volumeSlider = document.getElementById('playbackVolume');
+      
+      // Ensure reliable delivery checkbox matches internal state
+      if (reliableDeliveryCheckbox) {
+        reliableDeliveryCheckbox.checked = reliableDelivery;
+      }
+      
+      // Ensure natural bypass checkbox matches internal state
+      if (naturalBypassCheckbox) {
+        naturalBypassCheckbox.checked = naturalBypass;
+      }
+      
+      // Ensure volume control is always enabled (never conflicts with reliable delivery)
+      if (volumeSlider) {
+        volumeSlider.disabled = false;
+      }
+      
+      // Apply appropriate control states based on reliable delivery mode
+      if (reliableDelivery) {
+        // Disable conflicting controls but keep volume enabled
+        if (loudnessBoostCheckbox && loudnessBoostCheckbox.checked) {
+          loudnessBoostCheckbox.checked = false;
+          this.toggleLoudnessBoost(false);
+        }
+        if (naturalBypassCheckbox && naturalBypassCheckbox.checked) {
+          naturalBypassCheckbox.checked = false;
+          this.naturalBypass = false;
+        }
+        this.setEQControlsState(false);
+      } else {
+        // Enable all controls
+        this.setEQControlsState(true);
+      }
+      
+      console.log('All control states refreshed');
+    } catch (error) {
+      console.warn('Error refreshing control states:', error);
+    }
+  }
+
+  // Auto-resolve control conflicts
+  resolveControlConflicts() {
+    try {
+      const validation = this.validateControlState();
+      const { issues, warnings } = validation;
+      
+      if (issues.length > 0 || warnings.length > 0) {
+        console.log('Control validation results:', { issues, warnings });
+        
+        // Resolve critical issues
+        if (issues.length > 0) {
+          if (this.features.reliableDelivery) {
+            this.disableConflictingControls();
+          }
+          
+          // Fix disabled but checked controls
+          const loudnessToggle = document.getElementById('loudnessBoost');
+          const naturalToggle = document.getElementById('naturalBypass');
+          
+          if (loudnessToggle?.disabled && loudnessToggle.checked) {
+            loudnessToggle.checked = false;
+            this.toggleLoudnessBoost(false);
+          }
+          
+          if (naturalToggle?.disabled && naturalToggle.checked) {
+            naturalToggle.checked = false;
+            this.naturalBypass = false;
+          }
+        }
+        
+        // Handle warnings (less critical)
+        if (warnings.length > 0) {
+          warnings.forEach(warning => {
+            console.warn('Control state warning:', warning);
+          });
+        }
+        
+        return { resolved: issues.length > 0, issues, warnings };
+      }
+      
+      return { resolved: false, issues: [], warnings: [] };
+    } catch (error) {
+      console.error('Error resolving control conflicts:', error);
+      return { resolved: false, issues: ['Failed to resolve conflicts'], warnings: [] };
+    }
+  }
+
   filterDevices(q) {
     const query = (q || '').trim().toLowerCase();
     document.querySelectorAll('#deviceList > div').forEach(card => {
@@ -1222,22 +2153,55 @@ class AudioTransferApp {
 
   showToast(message, type = 'info') {
     const container = document.getElementById('toastContainer');
-    if (!container) { console.log(`${type.toUpperCase()}:`, message); return; }
-    const id = 't' + Date.now();
-    const bg = type === 'error' ? 'bg-danger' : type === 'success' ? 'bg-success' : type === 'warning' ? 'bg-warning text-dark' : 'bg-info';
-    // Determine appropriate text color if not explicitly set
-    const forceDark = bg.includes('bg-warning');
-    const textClass = forceDark ? '' : 'text-white';
-    const closeClass = forceDark ? '' : 'btn-close-white';
-    const html = `<div id="${id}" class="toast ${bg} ${textClass} align-items-center" role="alert" aria-live="assertive" aria-atomic="true" style="min-width:200px; margin-bottom:6px; box-shadow:0 2px 6px rgba(0,0,0,0.35);"><div class="d-flex"><div class="toast-body" style="white-space:normal; word-break:break-word;">${message}</div><button type="button" class="btn-close ${closeClass} me-2 m-auto" data-bs-dismiss="toast"></button></div></div>`;
-    container.insertAdjacentHTML('beforeend', html);
-    const el = document.getElementById(id);
+    if (!container) { 
+      console.log(`${type.toUpperCase()}:`, message); 
+      return; 
+    }
+    
     try {
-      const bsToast = new bootstrap.Toast(el, { delay: 4000 });
-      bsToast.show();
-      el.addEventListener('hidden.bs.toast', () => el.remove());
-    } catch {
-      setTimeout(() => el.remove(), 4000);
+      const id = 't' + Date.now();
+      const bg = type === 'error' ? 'bg-danger' : type === 'success' ? 'bg-success' : type === 'warning' ? 'bg-warning text-dark' : 'bg-info';
+      // Determine appropriate text color if not explicitly set
+      const forceDark = bg.includes('bg-warning');
+      const textClass = forceDark ? '' : 'text-white';
+      const closeClass = forceDark ? '' : 'btn-close-white';
+      
+      // Sanitize message to prevent XSS
+      const safeMessage = String(message).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      
+      const html = `<div id="${id}" class="toast ${bg} ${textClass} align-items-center" role="alert" aria-live="assertive" aria-atomic="true" style="min-width:200px; margin-bottom:6px; box-shadow:0 2px 6px rgba(0,0,0,0.35);"><div class="d-flex"><div class="toast-body" style="white-space:normal; word-break:break-word;">${safeMessage}</div><button type="button" class="btn-close ${closeClass} me-2 m-auto" data-bs-dismiss="toast"></button></div></div>`;
+      
+      container.insertAdjacentHTML('beforeend', html);
+      const el = document.getElementById(id);
+      
+      if (el) {
+        try {
+          if (typeof bootstrap !== 'undefined' && bootstrap.Toast) {
+            const bsToast = new bootstrap.Toast(el, { delay: 4000 });
+            bsToast.show();
+            el.addEventListener('hidden.bs.toast', () => {
+              if (el.parentNode) {
+                el.remove();
+              }
+            });
+          } else {
+            setTimeout(() => {
+              if (el.parentNode) {
+                el.remove();
+              }
+            }, 4000);
+          }
+        } catch (toastError) {
+          console.warn('Toast initialization error:', toastError);
+          setTimeout(() => {
+            if (el.parentNode) {
+              el.remove();
+            }
+          }, 4000);
+        }
+      }
+    } catch (error) {
+      console.error('Error showing toast:', error, message);
     }
   }
 }
